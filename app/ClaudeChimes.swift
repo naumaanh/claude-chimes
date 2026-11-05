@@ -529,26 +529,44 @@ final class AppModel: ObservableObject {
     var finished: [SessionState] { sessions.filter { $0.status == .finished } }
     var hasHealthFailure: Bool { health.contains { $0.level == .fail } }
 
+    var needsRepair: Bool { health.contains { $0.level == .fail || ($0.level == .warn && $0.id == "link") } }
+
     func refreshHealth() {
         health = Health.run(config: config)
         onChange?()
     }
 
+    /// Shows a short status line under the Health buttons, then clears it.
+    func flash(_ message: String, seconds: Double = 4) {
+        repairMessage = message
+        let shown = message
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+            if self?.repairMessage == shown { self?.repairMessage = nil }
+        }
+    }
+
+    func recheck() {
+        refreshHealth()
+        let issues = health.filter { $0.level != .ok }.count
+        flash(issues == 0 ? "All checks passed." : "\(issues) issue\(issues == 1 ? "" : "s") found.")
+    }
+
     func repair() {
         do {
             try Health.repair()
-            repairMessage = "Repaired. Restart open Claude sessions to load the hooks."
+            refreshHealth()
+            flash("Repaired. Restart open Claude sessions to load the hooks.", seconds: 6)
         } catch {
-            repairMessage = "Repair failed: \(error.localizedDescription)"
+            refreshHealth()
+            flash("Repair failed: \(error.localizedDescription)", seconds: 8)
         }
-        refreshHealth()
     }
 
     func copyDiagnostics() {
         refreshHealth()
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(Health.diagnostics(config: config, checks: health, sessions: sessions), forType: .string)
-        repairMessage = "Diagnostics copied to the clipboard."
+        flash("Diagnostics copied to the clipboard.")
     }
 
     func reloadSessions() {
@@ -608,7 +626,8 @@ struct SoundRow: View {
                 Text(detail).font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
-            Picker(title, selection: $path) {
+            // Preview from the setter, so reloading the config from disk never plays a sound.
+            Picker(title, selection: Binding(get: { path }, set: { path = $0; model.preview($0) })) {
                 if !known.contains(path) { Text(displayName(path)).tag(path) }
                 ForEach(groups, id: \.0) { group in
                     Section(group.0) {
@@ -622,7 +641,6 @@ struct SoundRow: View {
                 .buttonStyle(.borderless)
                 .help("Play \(displayName(path))")
         }
-        .onChange(of: path) { _, new in model.preview(new) }
     }
 }
 
@@ -658,7 +676,7 @@ struct SettingsView: View {
                 }
                 Text("Red when a session needs your input, gray when sessions are only waiting for your reply.")
                     .font(.caption).foregroundStyle(.secondary)
-                Toggle("List sessions that finished and are waiting for your reply", isOn: $model.config.showFinished)
+                Toggle("List sessions ready for your reply", isOn: $model.config.showFinished)
             }
 
             Section("General") {
@@ -687,6 +705,7 @@ struct SettingsView: View {
                 }
                 HStack {
                     Button("Repair") { model.repair() }
+                        .disabled(!model.needsRepair)
                         .help("Relink chime-hook to this app and re-add the Claude Code hooks (backs up settings.json first)")
                     Button("Copy Diagnostics") { model.copyDiagnostics() }
                     Button("Show Log") {
@@ -694,7 +713,7 @@ struct SettingsView: View {
                         NSWorkspace.shared.activateFileViewerSelecting([EventLog.url])
                     }
                     Spacer()
-                    Button { model.refreshHealth() } label: { Image(systemName: "arrow.clockwise") }
+                    Button { model.recheck() } label: { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.borderless).help("Check again")
                 }
                 if let msg = model.repairMessage {
@@ -853,19 +872,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(.separator())
         }
 
-        menu.addItem(NSMenuItem.sectionHeader(title: "Needs Your Input"))
-        if needs.isEmpty {
-            let none = NSMenuItem(title: "Nothing waiting", action: nil, keyEquivalent: "")
+        if needs.isEmpty && finished.isEmpty {
+            let none = NSMenuItem(title: "Nothing waiting on you", action: nil, keyEquivalent: "")
             none.isEnabled = false
             menu.addItem(none)
         }
+        if !needs.isEmpty { menu.addItem(NSMenuItem.sectionHeader(title: "Needs Your Input")) }
         for s in needs.prefix(10) {
             menu.addItem(sessionItem(s, symbol: "exclamationmark.bubble.fill",
                                      detail: [s.message, ago(s.updatedAt)].compactMap { $0 }.joined(separator: " · ")))
         }
 
         if !finished.isEmpty {
-            menu.addItem(.separator())
+            if !needs.isEmpty { menu.addItem(.separator()) }
             menu.addItem(NSMenuItem.sectionHeader(title: "Ready for Your Reply"))
             for s in finished.prefix(10) {
                 menu.addItem(sessionItem(s, symbol: "checkmark.bubble", detail: "Finished \(ago(s.updatedAt))"))
@@ -963,6 +982,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             w.isReleasedWhenClosed = false
             w.contentView = NSHostingView(rootView: SettingsView(model: model))
             w.center()
+            w.setFrameAutosaveName("ClaudeChimesSettings")
             settingsWindow = w
         }
         model.launchAtLogin = SMAppService.mainApp.status == .enabled
