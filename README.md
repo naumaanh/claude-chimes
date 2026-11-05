@@ -22,7 +22,7 @@ The six chimes are synthesized on your Mac by a small Python script, so nothing 
 
 The menu bar lists the sessions waiting on you. Some need your input, with the question they're asking; others have finished and are ready for your reply. A badge next to the icon counts them, red when something needs you and gray when sessions are only waiting for a reply. Clicking a desktop-app chat opens it, and clicking a CLI session brings your terminal to the front.
 
-The menu also has volume and mute. Everything else lives in a Settings window, where you can pick each sound from the bundled chimes, your own files or the macOS sounds, preview it, and check that the setup is healthy. To add your own sounds, drop any `.wav`, `.aiff`, `.mp3`, `.m4a` or `.caf` file into `~/.claude/chimes/sounds`.
+The menu also has volume and mute. It can also show a small on-screen banner when a session needs you or finishes, naming the session and what it's waiting for. Everything else lives in a Settings window, where you can pick each sound from the bundled chimes, your own files or the macOS sounds, preview it, and check that the setup is healthy. To add your own sounds, drop any `.wav`, `.aiff`, `.mp3`, `.m4a` or `.caf` file into `~/.claude/chimes/sounds`.
 
 The chimes play straight from the hooks, so they work even when the menu bar app isn't running. Nothing leaves your Mac.
 
@@ -77,11 +77,12 @@ A session leaves the list when you reply, approve the tool it asked about, or cl
   <img src="docs/settings.png" alt="The Settings window" width="420">
 </p>
 
-The Settings window has five sections:
+The Settings window has six sections:
 
 - Sounds: the Needs input and Finished sounds, each with a play button.
 - Volume: the slider and Mute.
 - Menu Bar: what the badge counts (Needs input and finished, Needs input only, or Off) and whether finished sessions are listed.
+- Banners: which sessions pop up a banner (needs input and finished, needs input only, or off), where it appears (top right, top center or bottom right), and how long it stays (4, 8 or 15 seconds, or until you dismiss it), plus a Show Test Banner button. Clicking a banner opens the session, and its × dismisses it. A banner waits while your pointer is over it, and closes by itself once you reply.
 - General: Launch at Login, a button that opens the sounds folder, and Uninstall.
 - Health: whether the hooks are installed, the hook link points at this app, your sounds exist, and hook events are arriving. Repair fixes the setup, Copy Diagnostics copies a report for bug reports, and Show Log opens the event log. When a check fails, the menu shows a Setup needs attention item.
 
@@ -96,6 +97,9 @@ volume=0.40
 muted=0
 badge=all
 showFinished=1
+banner=all
+bannerPosition=topRight
+bannerSeconds=8
 ```
 
 ## How it works
