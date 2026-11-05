@@ -767,7 +767,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func watchSessions() {
         try? FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
-        let fd = open(sessionsDir.path, O_EVTONLY)
+        let fd = Darwin.open(sessionsDir.path, O_EVTONLY)
         guard fd >= 0 else { return }
         let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .delete, .rename], queue: .main)
         src.setEventHandler { [weak self] in MainActor.assumeIsolated { self?.model.reloadSessions() } }
@@ -800,6 +800,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         model.reloadConfig()
         model.reloadSessions()
         model.refreshHealth()
+        build(menu)
+    }
+
+    /// Fills the menu from the model. Also called while the menu is open, after a session is dismissed.
+    func build(_ menu: NSMenu) {
         menu.removeAllItems()
 
         let needs = model.needsInput
@@ -821,7 +826,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if !needs.isEmpty { menu.addItem(NSMenuItem.sectionHeader(title: "Needs Your Input")) }
         for s in needs.prefix(10) {
-            menu.addItem(sessionItem(s, symbol: "exclamationmark.bubble.fill",
+            menu.addItem(sessionItem(s, symbol: "exclamationmark.bubble.fill", tint: .systemRed,
                                      detail: [s.message, ago(s.updatedAt)].compactMap { $0 }.joined(separator: " · ")))
         }
 
@@ -849,13 +854,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Date().timeIntervalSince(date) < 45 ? "just now" : relative.localizedString(for: date, relativeTo: Date())
     }
 
-    func sessionItem(_ s: SessionState, symbol: String, detail: String) -> NSMenuItem {
-        let i = item(s.title, #selector(openSession(_:)))
+    /// A session row: click to open it, or click its × to dismiss it when you're done.
+    func sessionItem(_ s: SessionState, symbol: String, tint: NSColor = .secondaryLabelColor, detail: String) -> NSMenuItem {
+        let i = NSMenuItem(title: s.title, action: nil, keyEquivalent: "")
         i.representedObject = s
-        i.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         i.toolTip = s.cwd
-        if #available(macOS 14.4, *) { i.subtitle = detail } else { i.title = "\(s.title) (\(detail))" }
+        i.view = SessionRowView(title: s.title, subtitle: detail, symbol: symbol, iconTint: tint,
+                                onOpen: { [weak self] in self?.open(s) },
+                                onDismiss: { [weak self, weak i] in self?.dismiss(s, in: i?.menu) })
         return i
+    }
+
+    /// Removes one session from the list (you're done with it) and redraws the open menu.
+    func dismiss(_ s: SessionState, in menu: NSMenu?) {
+        Sessions.remove(s.id)
+        EventLog.append("dismiss session=\(s.id.prefix(8)) status=\(s.status.rawValue)")
+        model.reloadSessions()
+        if let menu { build(menu) }
     }
 
     func item(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
@@ -902,8 +917,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Opens the session: desktop chats open directly via the Claude app's `claude://code/continue` link;
     /// CLI sessions (and older entries without a desktop ID) bring their app to the front.
-    @objc func openSession(_ sender: NSMenuItem) {
-        guard let s = sender.representedObject as? SessionState else { return }
+    func open(_ s: SessionState) {
         if let link = s.desktopLink, NSWorkspace.shared.open(link) {
             EventLog.append("open session=\(s.id.prefix(8)) via=desktop-link")
             return
@@ -975,6 +989,7 @@ if let i = args.firstIndex(of: "--hook") {
 //   --uninstall       remove the hooks, the link and session state (add --delete-data to remove sounds and config)
 //   --doctor          print the health check; exits 1 if anything fails
 //   --list-sessions   print the sessions currently waiting on you (pruning stale ones)
+//   --dismiss <id>    remove one session from the list (the full ID, or a unique prefix of it)
 if args.contains("--doctor") {
     let checks = Health.run(config: Config.load())
     print(Health.diagnostics(config: Config.load(), checks: checks, sessions: Sessions.all()))
@@ -988,6 +1003,18 @@ if args.contains("--setup") || args.contains("--repair") {
 if args.contains("--uninstall") {
     do { try Installer.uninstall(deleteData: args.contains("--delete-data")); print("Claude Chimes hooks removed.") }
     catch { FileHandle.standardError.write(Data("Uninstall failed: \(error.localizedDescription)\n".utf8)); exit(1) }
+    exit(0)
+}
+if let i = args.firstIndex(of: "--dismiss") {
+    let wanted = i + 1 < args.count ? args[i + 1] : ""
+    let matches = Sessions.all().filter { !wanted.isEmpty && $0.id.hasPrefix(wanted) }
+    guard matches.count == 1, let s = matches.first else {
+        FileHandle.standardError.write(Data("\(matches.isEmpty ? "No session matches" : "More than one session matches") '\(wanted)'.\n".utf8))
+        exit(1)
+    }
+    Sessions.remove(s.id)
+    EventLog.append("dismiss session=\(s.id.prefix(8)) status=\(s.status.rawValue) via=cli")
+    print("Dismissed \(s.title)")
     exit(0)
 }
 if args.contains("--list-sessions") {
@@ -1058,6 +1085,42 @@ if let i = args.firstIndex(of: "--snapshot-welcome"), i + 1 < args.count {
         if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
             view.cacheDisplay(in: view.bounds, to: rep)
             try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: args[i + 1]))
+        }
+    }
+    exit(0)
+}
+
+// `ClaudeChimes --snapshot-rows out.png [--dark]` renders session rows (one hovered) as they look in the menu.
+if let i = args.firstIndex(of: "--snapshot-rows"), i + 1 < args.count {
+    MainActor.assumeIsolated {
+        _ = NSApplication.shared
+        let dark = args.contains("--dark")
+        let rows = [
+            SessionRowView(title: "Fix the login redirect", subtitle: "Claude needs your permission to use Bash · just now",
+                           symbol: "exclamationmark.bubble.fill", iconTint: .systemRed, onOpen: {}, onDismiss: {}),
+            SessionRowView(title: "Write the release notes", subtitle: "Finished 4 min ago", symbol: "checkmark.bubble", onOpen: {}, onDismiss: {}),
+            SessionRowView(title: "Refactor the settings parser", subtitle: "Finished 12 min ago", symbol: "checkmark.bubble", onOpen: {}, onDismiss: {}),
+        ]
+        let w: CGFloat = 320, h = CGFloat(rows.count) * SessionRowView.height + 12
+        let panel = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        for (n, r) in rows.enumerated() {
+            r.frame = NSRect(x: 0, y: h - 6 - CGFloat(n + 1) * SessionRowView.height, width: w, height: SessionRowView.height)
+            r.setHovering(n == 1)
+            panel.addSubview(r)
+        }
+        let window = NSWindow(contentRect: panel.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+        window.backgroundColor = dark ? NSColor(white: 0.17, alpha: 1) : NSColor(white: 0.96, alpha: 1)
+        window.contentView = panel
+        panel.wantsLayer = true
+        panel.layer?.backgroundColor = window.backgroundColor.cgColor
+        panel.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        window.appearance!.performAsCurrentDrawingAppearance {
+            if let rep = panel.bitmapImageRepForCachingDisplay(in: panel.bounds) {
+                panel.cacheDisplay(in: panel.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: args[i + 1]))
+            }
         }
     }
     exit(0)

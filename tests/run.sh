@@ -74,6 +74,8 @@ LIST="$(lim "$HOOK" --list-sessions </dev/null)"
 check "desktop chat gets its link" 'echo "$LIST" | grep "^finished	d1" | grep -q "claude://code/continue?session=local_abc-123"'
 check "CLI session doesn't use an inherited desktop ID" 'echo "$LIST" | grep "^finished	c1" | grep -q "	-$"'
 check "malformed desktop ID is rejected" 'echo "$LIST" | grep "^finished	x1" | grep -q "	-$"'
+check "--dismiss removes one session by ID prefix" 'lim "$HOOK" --dismiss d1 </dev/null >/dev/null && ! has d1 && has c1'
+check "--dismiss fails on an unknown ID" '! lim "$HOOK" --dismiss nope </dev/null 2>/dev/null'
 rm -f "$SESSIONS"/*.json
 
 section "Stale sessions are pruned"

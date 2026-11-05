@@ -69,7 +69,7 @@ If you open the app without running the installer, for example a copy built with
 
 ## Using it
 
-The menu bar menu has two lists. Needs Your Input shows sessions with a permission prompt or question waiting, what they're asking, and how long ago. Ready for Your Reply shows sessions that finished a reply in the last day, and Clear Finished empties it. Clicking a desktop chat opens it through the app's `claude://code/continue?session=…` link. Below the lists are a volume slider (it plays a preview when you let go), Mute (⌘M), Settings… (⌘,) and Quit.
+The menu bar menu has two lists. Needs Your Input shows sessions with a permission prompt or question waiting, what they're asking, and how long ago. Ready for Your Reply shows sessions that finished a reply in the last day, and Clear Finished empties it. Click a row to open the session; a desktop chat opens through the app's `claude://code/continue?session=…` link. Click the × at the end of a row to dismiss just that session once you're done with it. Below the lists are a volume slider (it plays a preview when you let go), Mute (⌘M), Settings… (⌘,) and Quit.
 
 A session leaves the list when you reply, approve the tool it asked about, or close it. If Claude quits without closing the session cleanly, after a crash or a closed terminal, the app sees that the process is gone and drops the session as well.
 
@@ -122,6 +122,7 @@ Start with Settings → Health. From a terminal you can also run:
 ~/.claude/chimes/chime-hook --doctor         # health report and recent events (exit code 1 if something fails)
 ~/.claude/chimes/chime-hook --repair         # copy missing chimes, relink the hook, re-add the hooks (backs up settings.json)
 ~/.claude/chimes/chime-hook --list-sessions  # what's waiting on you right now
+~/.claude/chimes/chime-hook --dismiss <id>   # remove one session from the list (an ID prefix works)
 ```
 
 If a session that was already open stays silent, restart it so it loads the hooks. If you moved the app, it relinks itself the next time it launches. If another tool rewrote `settings.json`, use Repair, which adds back only the Claude Chimes hooks.

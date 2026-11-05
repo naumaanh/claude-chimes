@@ -3,6 +3,7 @@
 ## [1.4.0] - 2026-11-05
 
 ### Added
+- An × on every session in the menu dismisses just that session when you're done with it, and the menu stays open. `--dismiss <id>` does the same from a terminal.
 - The app is self-contained. The six chimes and the icon are bundled, and the app sets itself up, so a downloaded copy works without the repo or Xcode tools.
 - First-run welcome window. It appears when the hooks are missing, lists exactly what setup will change, and does the setup on Set Up.
 - Uninstall from Settings → General. It removes the hooks after a backup, can also delete your sounds and settings, and moves the app to the Trash.
