@@ -22,7 +22,15 @@ let configURL = chimesDir.appendingPathComponent("config")
 let systemSoundsDir = URL(fileURLWithPath: "/System/Library/Sounds")
 let audioExts: Set<String> = ["wav", "aiff", "aif", "mp3", "m4a", "caf"]
 let repoURL = URL(string: "https://github.com/naumaanh/claude-chimes")!
-let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+/// The real app bundle, even when this binary runs through the ~/.claude/chimes/chime-hook symlink
+/// (Bundle.main would then be ~/.claude/chimes).
+let appBundle: Bundle = {
+    let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+    let contents = exe.deletingLastPathComponent().deletingLastPathComponent()
+    if contents.lastPathComponent == "Contents", let b = Bundle(url: contents.deletingLastPathComponent()) { return b }
+    return Bundle.main
+}()
+let appVersion = appBundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
 
 // MARK: - Config
 
@@ -107,6 +115,36 @@ struct SessionState: Codable, Identifiable {
     var message: String?
     var appBundleID: String?   // the app the session runs in (Claude desktop, Terminal, iTerm, ...)
     var updatedAt: Date
+    // Added in 1.3 (optional so older files still decode):
+    var pid: Int32?            // the session's Claude Code process (CLAUDE_PID)
+    var pidStart: Double?      // that process's start time, so a reused PID isn't mistaken for it
+    var entrypoint: String?    // CLAUDE_CODE_ENTRYPOINT: "claude-desktop", "cli", ...
+
+    /// Whether the session can still be waiting on you, judged by its Claude process.
+    /// A pending prompt dies with its process. A finished desktop session can be resumed after
+    /// the app restarts its process, so only finished CLI sessions are dropped when the process exits.
+    var isStale: Bool {
+        guard let pid, !ProcessCheck.isAlive(pid: pid, startedAt: pidStart) else { return false }
+        return status == .needsInput || entrypoint != "claude-desktop"
+    }
+}
+
+enum ProcessCheck {
+    /// Start time of a running process (seconds since 1970), or nil if no such process exists.
+    static func startTime(_ pid: Int32) -> Double? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0, info.kp_proc.p_pid == pid else { return nil }
+        let tv = info.kp_proc.p_starttime
+        return Double(tv.tv_sec) + Double(tv.tv_usec) / 1_000_000
+    }
+
+    static func isAlive(pid: Int32, startedAt: Double?) -> Bool {
+        guard let now = startTime(pid) else { return false }
+        guard let startedAt else { return true }
+        return abs(now - startedAt) < 2
+    }
 }
 
 enum Sessions {
@@ -129,13 +167,27 @@ enum Sessions {
 
     static func remove(_ id: String) { try? FileManager.default.removeItem(at: url(id)) }
 
-    /// All recorded sessions, newest first. Entries older than a day are pruned.
+    /// All recorded sessions, newest first. Prunes entries older than a day, sessions whose
+    /// Claude process has exited (see `isStale`), and unreadable files.
     static func all() -> [SessionState] {
         let files = (try? FileManager.default.contentsOfDirectory(at: sessionsDir, includingPropertiesForKeys: nil)) ?? []
         var out: [SessionState] = []
         for f in files where f.pathExtension == "json" {
-            guard let d = try? Data(contentsOf: f), let s = try? decoder.decode(SessionState.self, from: d) else { continue }
-            if Date().timeIntervalSince(s.updatedAt) > maxAge { try? FileManager.default.removeItem(at: f); continue }
+            guard let d = try? Data(contentsOf: f), let s = try? decoder.decode(SessionState.self, from: d) else {
+                // Half-written files are replaced atomically, so anything unreadable here is junk.
+                if let age = try? f.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+                   Date().timeIntervalSince(age) > 60 { try? FileManager.default.removeItem(at: f) }
+                continue
+            }
+            if Date().timeIntervalSince(s.updatedAt) > maxAge {
+                try? FileManager.default.removeItem(at: f)
+                continue
+            }
+            if s.isStale {
+                try? FileManager.default.removeItem(at: f)
+                EventLog.append("pruned session=\(s.id.prefix(8)) reason=process-exited status=\(s.status.rawValue)")
+                continue
+            }
             out.append(s)
         }
         return out.sorted { $0.updatedAt > $1.updatedAt }
@@ -163,11 +215,55 @@ func transcriptTitle(_ path: String?) -> String? {
     return title
 }
 
+// MARK: - Event log
+
+/// A small rotating log of hook events (~/.claude/chimes/events.log) for diagnostics.
+enum EventLog {
+    static let url = chimesDir.appendingPathComponent("events.log")
+    static let maxBytes = 256 * 1024
+
+    static func append(_ message: String) {
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        guard let data = "\(stamp) \(message)\n".data(using: .utf8) else { return }
+        let fm = FileManager.default
+        try? fm.createDirectory(at: chimesDir, withIntermediateDirectories: true)
+        if let size = (try? fm.attributesOfItem(atPath: url.path))?[.size] as? Int, size > maxBytes { rotate() }
+        if let h = try? FileHandle(forWritingTo: url) {
+            h.seekToEndOfFile()
+            h.write(data)
+            try? h.close()
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
+    /// Keeps the newest half of the log.
+    static func rotate() {
+        guard let d = try? Data(contentsOf: url), d.count > maxBytes / 2 else { return }
+        var tail = d.suffix(maxBytes / 2)
+        if let nl = tail.firstIndex(of: UInt8(ascii: "\n")) { tail = tail[tail.index(after: nl)...] }
+        try? Data(tail).write(to: url, options: .atomic)
+    }
+
+    static func tail(_ n: Int) -> [String] {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        return Array(text.split(separator: "\n").suffix(n).map(String.init))
+    }
+
+    static var lastWrite: Date? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+    }
+}
+
 // MARK: - Hook mode
 
 /// Plays a sound with afplay, detached so the hook returns immediately.
 func playDetached(_ path: String, volume: Double) {
-    guard volume > 0, FileManager.default.fileExists(atPath: path) else { return }
+    guard volume > 0 else { return }
+    guard FileManager.default.fileExists(atPath: path) else {
+        EventLog.append("warn sound-missing path=\(path)")
+        return
+    }
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/sh")
     p.arguments = ["-c", "nohup /usr/bin/afplay -v \"$1\" \"$2\" >/dev/null 2>&1 &", "sh",
@@ -184,20 +280,29 @@ func runHook(_ event: String) -> Never {
     let cwd = payload["cwd"] as? String ?? ""
     let volume = Double(env["CLAUDE_CHIMES_VOLUME"] ?? "") ?? config.volume
 
+    let short = id.isEmpty ? "-" : String(id.prefix(8))
+
     func record(_ status: SessionState.Status, message: String?) {
         guard !id.isEmpty else { return }
         let previous = Sessions.read(id)
         let folder = URL(fileURLWithPath: cwd).lastPathComponent
         let title = transcriptTitle(payload["transcript_path"] as? String) ?? previous?.title ?? (folder.isEmpty ? "Claude session" : folder)
+        let pid = env["CLAUDE_PID"].flatMap { Int32($0) }
         Sessions.write(SessionState(id: id, status: status, title: title, cwd: cwd, message: message,
-                                    appBundleID: env["__CFBundleIdentifier"], updatedAt: Date()))
+                                    appBundleID: env["__CFBundleIdentifier"], updatedAt: Date(),
+                                    pid: pid, pidStart: pid.flatMap(ProcessCheck.startTime),
+                                    entrypoint: env["CLAUDE_CODE_ENTRYPOINT"]))
+        EventLog.append("\(event) session=\(short) status=\(status.rawValue) title=\"\(title)\"\(config.muted ? " muted" : "")")
     }
 
     switch event {
     case "notification":
         // Idle reminders arrive a minute after a reply finished; the Stop chime already covered that.
         let type = payload["notification_type"] as? String ?? ""
-        if type == "idle_prompt" || type == "auth_success" { exit(0) }
+        if type == "idle_prompt" || type == "auth_success" {
+            EventLog.append("notification session=\(short) type=\(type) skipped")
+            exit(0)
+        }
         record(.needsInput, message: payload["message"] as? String)
         if !config.muted { playDetached(config.input, volume: volume) }
     case "stop":
@@ -205,13 +310,194 @@ func runHook(_ event: String) -> Never {
         if !config.muted { playDetached(config.done, volume: volume) }
     case "tool":
         // A tool ran, so any permission prompt for this session has been answered.
-        if Sessions.read(id)?.status == .needsInput { Sessions.remove(id) }
+        // (Runs after every tool call, so it only logs when it changes something.)
+        if Sessions.read(id)?.status == .needsInput {
+            Sessions.remove(id)
+            EventLog.append("tool session=\(short) cleared needs-input")
+        }
     case "prompt", "end":
-        Sessions.remove(id)
+        if Sessions.read(id) != nil { Sessions.remove(id) }
+        EventLog.append("\(event) session=\(short) cleared")
     default:
-        break
+        EventLog.append("warn unknown-event \(event)")
     }
     exit(0)
+}
+
+// MARK: - Health check and repair
+
+struct HealthCheck: Identifiable {
+    enum Level: Int { case ok, warn, fail }
+    let id: String
+    let level: Level
+    let title: String
+    let detail: String
+}
+
+enum Health {
+    static let settingsURL = homeDir.appendingPathComponent(".claude/settings.json")
+    static let hookLink = chimesDir.appendingPathComponent("chime-hook")
+    static let ours = "/.claude/chimes/chime"
+    /// (hook event, chime-hook argument, runs in the background)
+    static let wanted: [(String, String, Bool)] = [
+        ("Notification", "notification", false), ("Stop", "stop", false),
+        ("UserPromptSubmit", "prompt", true), ("PostToolUse", "tool", true), ("SessionEnd", "end", true),
+    ]
+
+    /// The binary the hook link should point at: this app's own executable.
+    static var appBinary: URL? { appBundle.executableURL?.resolvingSymlinksInPath() }
+
+    static func readSettings() -> (json: [String: Any]?, error: String?) {
+        guard let data = try? Data(contentsOf: settingsURL) else { return (nil, "~/.claude/settings.json not found") }
+        if data.allSatisfy({ $0 == 0x20 || $0 == 0x0A || $0 == 0x09 || $0 == 0x0D }) { return ([:], nil) }
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return (nil, "~/.claude/settings.json isn't valid JSON, so Claude Code may be ignoring it")
+        }
+        return (obj, nil)
+    }
+
+    static func commands(in settings: [String: Any], event: String) -> [String] {
+        let groups = (settings["hooks"] as? [String: Any])?[event] as? [[String: Any]] ?? []
+        return groups.flatMap { ($0["hooks"] as? [[String: Any]] ?? []).compactMap { $0["command"] as? String } }
+    }
+
+    static func run(config: Config) -> [HealthCheck] {
+        var out: [HealthCheck] = []
+        let (settings, error) = readSettings()
+
+        if let error {
+            out.append(.init(id: "settings", level: .fail, title: "Claude Code settings", detail: error))
+        } else if let settings {
+            if settings["disableAllHooks"] as? Bool == true {
+                out.append(.init(id: "disabled", level: .fail, title: "Hooks are turned off",
+                                 detail: "\"disableAllHooks\" is true in ~/.claude/settings.json, so no chimes will play."))
+            }
+            let missing = wanted.filter { ev, arg, _ in
+                !commands(in: settings, event: ev).contains { $0.contains("chimes/chime-hook \(arg)") }
+            }.map(\.0)
+            out.append(missing.isEmpty
+                ? .init(id: "hooks", level: .ok, title: "Claude Code hooks", detail: "All \(wanted.count) hooks are installed.")
+                : .init(id: "hooks", level: .fail, title: "Claude Code hooks", detail: "Missing: \(missing.joined(separator: ", ")). Repair adds them back."))
+        }
+
+        let target = (try? FileManager.default.destinationOfSymbolicLink(atPath: hookLink.path))
+            .map { URL(fileURLWithPath: $0, relativeTo: chimesDir).resolvingSymlinksInPath() }
+        if target == nil || !FileManager.default.isExecutableFile(atPath: hookLink.path) {
+            out.append(.init(id: "link", level: .fail, title: "Hook link",
+                             detail: "~/.claude/chimes/chime-hook is missing or broken. Repair relinks it to this app."))
+        } else if let app = appBinary, target?.path != app.path, appBundle.bundleURL.pathExtension == "app" {
+            out.append(.init(id: "link", level: .warn, title: "Hook link",
+                             detail: "Points at a different copy of the app (\(target!.path)). Repair points it here."))
+        } else {
+            out.append(.init(id: "link", level: .ok, title: "Hook link", detail: "~/.claude/chimes/chime-hook → this app"))
+        }
+
+        let missingSounds = [config.input, config.done].filter { !FileManager.default.fileExists(atPath: $0) }
+        out.append(missingSounds.isEmpty
+            ? .init(id: "sounds", level: .ok, title: "Sound files", detail: "Both chosen sounds are on disk.")
+            : .init(id: "sounds", level: .fail, title: "Sound files",
+                    detail: "Not found: \(missingSounds.map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: ", ")). Pick another sound."))
+
+        if config.muted || config.volume == 0 {
+            out.append(.init(id: "volume", level: .warn, title: "Volume",
+                             detail: config.muted ? "Chimes are muted." : "Volume is at 0%, so chimes are silent."))
+        }
+
+        if let last = EventLog.lastWrite {
+            let f = RelativeDateTimeFormatter()
+            out.append(.init(id: "events", level: .ok, title: "Last hook event",
+                             detail: Date().timeIntervalSince(last) < 45 ? "Just now" : f.localizedString(for: last, relativeTo: Date()).capitalizedFirst))
+        } else {
+            out.append(.init(id: "events", level: .warn, title: "Last hook event",
+                             detail: "None yet. Sessions that were already open need a restart to load the hooks."))
+        }
+        return out
+    }
+
+    /// Relinks chime-hook to this app and writes the hooks back into ~/.claude/settings.json
+    /// (after a timestamped backup). Other settings and hooks are kept.
+    static func repair() throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: chimesDir, withIntermediateDirectories: true)
+        if let app = appBinary {
+            try? fm.removeItem(at: hookLink)
+            try fm.createSymbolicLink(at: hookLink, withDestinationURL: app)
+        }
+
+        var (settings, error) = readSettings()
+        if settings == nil {
+            if fm.fileExists(atPath: settingsURL.path) { throw NSError(domain: "ClaudeChimes", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: (error ?? "Unreadable settings") + ". Fix the file by hand, then try again."]) }
+            settings = [:]
+        }
+        var json = settings!
+        if fm.fileExists(atPath: settingsURL.path) {
+            let stamp = DateFormatter.backupStamp.string(from: Date())
+            try? fm.copyItem(at: settingsURL, to: settingsURL.appendingPathExtension("bak-chimes-\(stamp)"))
+        }
+
+        var hooks = json["hooks"] as? [String: Any] ?? [:]
+        for (event, value) in hooks {
+            let groups = (value as? [[String: Any]] ?? []).compactMap { group -> [String: Any]? in
+                let kept = (group["hooks"] as? [[String: Any]] ?? []).filter { !(($0["command"] as? String ?? "").contains(ours)) }
+                guard !kept.isEmpty else { return nil }
+                var g = group; g["hooks"] = kept; return g
+            }
+            hooks[event] = groups.isEmpty ? nil : groups
+        }
+        for (event, arg, background) in wanted {
+            var hook: [String: Any] = ["type": "command", "command": "~/.claude/chimes/chime-hook \(arg)", "timeout": 5]
+            if background { hook["async"] = true }
+            hooks[event] = (hooks[event] as? [[String: Any]] ?? []) + [["hooks": [hook]]]
+        }
+        json["hooks"] = hooks
+
+        let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        try fm.createDirectory(at: settingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try (data + Data("\n".utf8)).write(to: settingsURL, options: .atomic)
+        EventLog.append("repair hooks-rewritten link=\(appBinary?.path ?? "-")")
+    }
+
+    /// Quietly fixes the hook link at launch (for example after the app was moved).
+    /// Never touches settings.json without the user asking.
+    static func relinkIfNeeded() {
+        guard appBundle.bundleURL.pathExtension == "app", let app = appBinary else { return }
+        let current = (try? FileManager.default.destinationOfSymbolicLink(atPath: hookLink.path))
+            .map { URL(fileURLWithPath: $0, relativeTo: chimesDir).resolvingSymlinksInPath().path }
+        guard current != app.path else { return }
+        try? FileManager.default.createDirectory(at: chimesDir, withIntermediateDirectories: true)
+        try? FileManager.default.removeItem(at: hookLink)
+        if (try? FileManager.default.createSymbolicLink(at: hookLink, withDestinationURL: app)) != nil {
+            EventLog.append("relinked chime-hook -> \(app.path)")
+        }
+    }
+
+    static func diagnostics(config: Config, checks: [HealthCheck], sessions: [SessionState]) -> String {
+        let os = ProcessInfo.processInfo.operatingSystemVersionString
+        var lines = ["Claude Chimes \(appVersion) on macOS \(os) (\(machineArch()))",
+                     "App: \(appBundle.bundlePath)", "", "Health:"]
+        let mark = ["ok", "WARN", "FAIL"]
+        lines += checks.map { "  [\(mark[$0.level.rawValue])] \($0.title): \($0.detail)" }
+        lines += ["", "Config:"]
+        lines += ((try? String(contentsOf: configURL, encoding: .utf8)) ?? "(missing)")
+            .split(separator: "\n").filter { !$0.hasPrefix("#") }.map { "  \($0)" }
+        lines += ["", "Sessions: \(sessions.filter { $0.status == .needsInput }.count) need input, \(sessions.filter { $0.status == .finished }.count) finished"]
+        lines += ["", "Recent events:"] + EventLog.tail(40).map { "  \($0)" }
+        return lines.joined(separator: "\n")
+    }
+
+    static func machineArch() -> String {
+        var sys = utsname(); uname(&sys)
+        return withUnsafeBytes(of: &sys.machine) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+    }
+}
+
+extension DateFormatter {
+    static let backupStamp: DateFormatter = { let f = DateFormatter(); f.dateFormat = "yyyyMMddHHmmss"; return f }()
+}
+
+extension String {
+    var capitalizedFirst: String { prefix(1).uppercased() + dropFirst() }
 }
 
 // MARK: - Shared model
@@ -223,11 +509,36 @@ final class AppModel: ObservableObject {
     }
     @Published var sessions: [SessionState] = []
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Published var health: [HealthCheck] = []
+    @Published var repairMessage: String?
     var onChange: (() -> Void)?
     private var player: NSSound?
 
     var needsInput: [SessionState] { sessions.filter { $0.status == .needsInput } }
     var finished: [SessionState] { sessions.filter { $0.status == .finished } }
+    var hasHealthFailure: Bool { health.contains { $0.level == .fail } }
+
+    func refreshHealth() {
+        health = Health.run(config: config)
+        onChange?()
+    }
+
+    func repair() {
+        do {
+            try Health.repair()
+            repairMessage = "Repaired. Restart open Claude sessions to load the hooks."
+        } catch {
+            repairMessage = "Repair failed: \(error.localizedDescription)"
+        }
+        refreshHealth()
+    }
+
+    func copyDiagnostics() {
+        refreshHealth()
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(Health.diagnostics(config: config, checks: health, sessions: sessions), forType: .string)
+        repairMessage = "Diagnostics copied to the clipboard."
+    }
 
     func reloadSessions() {
         sessions = Sessions.all()
@@ -306,6 +617,7 @@ struct SoundRow: View {
 
 struct SettingsView: View {
     @ObservedObject var model: AppModel
+    var height: CGFloat = 760
 
     var body: some View {
         Form {
@@ -351,6 +663,35 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            Section("Health") {
+                ForEach(model.health) { check in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: ["checkmark.circle.fill", "exclamationmark.triangle.fill", "xmark.octagon.fill"][check.level.rawValue])
+                            .foregroundStyle([Color.green, Color.orange, Color.red][check.level.rawValue])
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(check.title)
+                            Text(check.detail).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                HStack {
+                    Button("Repair") { model.repair() }
+                        .help("Relink chime-hook to this app and re-add the Claude Code hooks (backs up settings.json first)")
+                    Button("Copy Diagnostics") { model.copyDiagnostics() }
+                    Button("Show Log") {
+                        if !FileManager.default.fileExists(atPath: EventLog.url.path) { EventLog.append("log opened") }
+                        NSWorkspace.shared.activateFileViewerSelecting([EventLog.url])
+                    }
+                    Spacer()
+                    Button { model.refreshHealth() } label: { Image(systemName: "arrow.clockwise") }
+                        .buttonStyle(.borderless).help("Check again")
+                }
+                if let msg = model.repairMessage {
+                    Text(msg).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .onAppear { model.refreshHealth() }
+
             Section {
                 HStack {
                     Text("Claude Chimes \(appVersion)")
@@ -362,7 +703,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 500, height: 680)
+        .frame(width: 500, height: height)
     }
 }
 
@@ -372,7 +713,7 @@ enum StatusIcon {
     /// Menu bar icon from the app bundle (Resources/menubar.svg, menubar-muted.svg) as a template image.
     static func image(muted: Bool) -> NSImage? {
         let name = muted ? "menubar-muted" : "menubar"
-        let img = Bundle.main.url(forResource: name, withExtension: "svg").flatMap { NSImage(contentsOf: $0) }
+        let img = appBundle.url(forResource: name, withExtension: "svg").flatMap { NSImage(contentsOf: $0) }
             ?? NSImage(systemSymbolName: muted ? "speaker.slash" : "waveform", accessibilityDescription: nil)
         img?.size = NSSize(width: 18, height: 18)
         img?.isTemplate = true
@@ -438,13 +779,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if !FileManager.default.fileExists(atPath: configURL.path) { model.config.save() }
         model.onChange = { [weak self] in self?.updateStatusButton() }
+        Health.relinkIfNeeded()
         watchSessions()
         model.reloadSessions()
-        // Pick up edits made outside the app and age out old sessions.
+        model.refreshHealth()
+        // Pick up edits made outside the app, age out old or exited sessions, and recheck health.
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.model.reloadConfig()
                 self?.model.reloadSessions()
+                self?.model.refreshHealth()
             }
         }
     }
@@ -473,6 +817,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.image = StatusIcon.image(muted: c.muted || c.volume == 0, count: count, urgent: needs > 0)
         button.title = ""
         var parts: [String] = []
+        if model.hasHealthFailure { parts.append("setup needs attention") }
         if needs > 0 { parts.append("\(needs) need\(needs == 1 ? "s" : "") your input") }
         if finished > 0 { parts.append("\(finished) ready for your reply") }
         button.toolTip = parts.isEmpty ? "Claude Chimes" : "Claude Chimes: " + parts.joined(separator: ", ")
@@ -482,10 +827,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         model.reloadConfig()
         model.reloadSessions()
+        model.refreshHealth()
         menu.removeAllItems()
 
         let needs = model.needsInput
         let finished = model.config.showFinished ? model.finished : []
+
+        if model.hasHealthFailure {
+            let warn = item("Setup needs attention…", #selector(openSettings))
+            warn.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: nil)
+            let first = model.health.first { $0.level == .fail }
+            if #available(macOS 14.4, *) { warn.subtitle = first.map { "\($0.title): open Settings to repair" } }
+            menu.addItem(warn)
+            menu.addItem(.separator())
+        }
 
         menu.addItem(NSMenuItem.sectionHeader(title: "Needs Your Input"))
         if needs.isEmpty {
@@ -585,7 +940,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openSettings() {
         if settingsWindow == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 680),
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 760),
                              styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
             w.title = "Claude Chimes Settings"
             w.isReleasedWhenClosed = false
@@ -606,12 +961,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 let args = CommandLine.arguments
 // Hook mode: run as `chime-hook <event>` (the symlink the installer creates) or `ClaudeChimes --hook <event>`.
 // It must never fall through to the menu bar app, or every hook call would launch another copy.
-if URL(fileURLWithPath: args[0]).lastPathComponent == "chime-hook" {
+// (A `--flag` argument skips hook mode, so `chime-hook --doctor` works too.)
+if URL(fileURLWithPath: args[0]).lastPathComponent == "chime-hook", !(args.count > 1 && args[1].hasPrefix("--")) {
     runHook(args.count > 1 ? args[1] : "")
 }
 if let i = args.firstIndex(of: "--hook") {
     runHook(i + 1 < args.count ? args[i + 1] : "")
 }
+// Command-line helpers (also handy when filing an issue):
+//   --doctor          print the health check; exits 1 if anything fails
+//   --repair          relink chime-hook to this binary and re-add the hooks
+//   --list-sessions   print the sessions currently waiting on you (pruning stale ones)
+if args.contains("--doctor") {
+    let checks = Health.run(config: Config.load())
+    print(Health.diagnostics(config: Config.load(), checks: checks, sessions: Sessions.all()))
+    exit(checks.contains { $0.level == .fail } ? 1 : 0)
+}
+if args.contains("--repair") {
+    do { try Health.repair(); print("Repaired. Restart open Claude sessions to load the hooks.") }
+    catch { FileHandle.standardError.write(Data("Repair failed: \(error.localizedDescription)\n".utf8)); exit(1) }
+    exit(0)
+}
+if args.contains("--list-sessions") {
+    for s in Sessions.all() {
+        print("\(s.status.rawValue)\t\(s.id.prefix(8))\tpid=\(s.pid.map(String.init) ?? "-")\t\(s.entrypoint ?? "-")\t\(s.title)")
+    }
+    exit(0)
+}
+
 // Used by uninstall.sh to remove the login item before the app is deleted.
 if args.contains("--disable-login-item") {
     try? SMAppService.mainApp.unregister()
@@ -654,8 +1031,8 @@ if let i = args.firstIndex(of: "--snapshot-icons"), i + 1 < args.count {
 if let i = args.firstIndex(of: "--snapshot-settings"), i + 1 < args.count {
     MainActor.assumeIsolated {
         _ = NSApplication.shared
-        let view = NSHostingView(rootView: SettingsView(model: AppModel()))
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 680),
+        let view = NSHostingView(rootView: SettingsView(model: AppModel(), height: 1180))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 1180),
                               styleMask: [.titled], backing: .buffered, defer: false)
         window.contentView = view
         window.appearance = NSAppearance(named: args.contains("--dark") ? .darkAqua : .aqua)

@@ -61,7 +61,7 @@ Running it again is safe. It replaces its own hooks and keeps your settings. Res
 - **Volume** slider (previews on release) and **Mute** (⌘M).
 - **Settings…** (⌘,) and **Quit**.
 
-A session leaves the list when you reply to it, approve the tool it was asking about, or close it.
+A session leaves the list when you reply to it, approve the tool it was asking about, or close it. If Claude quits without saying so (a crash, or a closed terminal), the app notices the process is gone and drops the session too.
 
 **The Settings window**
 
@@ -69,6 +69,7 @@ A session leaves the list when you reply to it, approve the tool it was asking a
 - **Volume**: slider and Mute.
 - **Menu Bar**: what the badge counts (*Needs input and finished*, *Needs input only*, or *Off*), and whether to list finished sessions.
 - **General**: Launch at Login, and a button that opens the sounds folder.
+- **Health**: checks that the hooks are installed, the hook link points at this app, your sounds exist, and hook events are arriving. **Repair** fixes the setup, **Copy Diagnostics** copies a report for bug reports, and **Show Log** opens the event log. If something breaks, the menu shows a *Setup needs attention* item.
 
 ### Without the menu bar app
 
@@ -97,7 +98,25 @@ Claude Code runs [hooks](https://docs.claude.com/en/docs/claude-code/hooks) on l
 
 `chime-hook` is the menu bar app's own binary running in hook mode. It plays sounds with `afplay` in the background, so Claude is never kept waiting. A hook call takes about 15 ms.
 
-Waiting sessions are stored as small JSON files in `~/.claude/chimes/sessions`. Each one holds the session ID, its title (read from the session's local transcript), its folder, and the prompt message. Entries older than a day are deleted. Nothing is sent anywhere.
+Waiting sessions are stored as small JSON files in `~/.claude/chimes/sessions`. Each one holds the session ID, its title (read from the session's local transcript), its folder, the prompt message, and the session's Claude process ID. Entries are deleted after a day, or sooner once their process exits. Two exceptions apply: a finished desktop-app session is kept, since the app can restart its process when you reply, and so is an entry with no process ID. Hook events are logged to `~/.claude/chimes/events.log`, which is capped at 256 KB. Nothing is sent anywhere.
+
+## Troubleshooting
+
+Open **Settings → Health** first. From a terminal you can also run:
+
+```bash
+~/.claude/chimes/chime-hook --doctor         # health report and recent events (exit code 1 if something fails)
+~/.claude/chimes/chime-hook --repair         # relink the hook and re-add the hooks (backs up settings.json)
+~/.claude/chimes/chime-hook --list-sessions  # what's waiting on you right now
+```
+
+Common causes:
+
+- **No chimes in a session that was already open:** restart that session so it loads the hooks.
+- **You moved the app:** it relinks itself the next time it launches.
+- **Another tool rewrote `settings.json`:** use **Repair**.
+
+Repair adds back only its own hooks and keeps everything else. It does write the file with its keys sorted alphabetically.
 
 **Tip:** to avoid hearing two sounds, turn off the desktop app's own notification sound. In the Claude desktop app, open Settings → Claude Code and set Notification sound to None, or open System Settings → Notifications → Claude and turn off "Play sound for notifications". Banners still show. Leave your Mac's main volume alone, since the chimes play through it.
 
