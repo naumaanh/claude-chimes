@@ -93,3 +93,11 @@ write("done-bloom.wav", mix([
     (0.14, note(hz(76), 1.6, WARM, attack=0.02), 0.55),
     (0.21, note(hz(84), 1.5, BELL), 0.35),
 ], 1.9))
+
+# ---------- "turn failed" sound (low and soft, clearly different from the others) ----------
+# dip: two muted marimba notes stepping down a minor third, low in the register
+write("error-dip.wav", mix([
+    (0.00, note(hz(64), 0.45, MARIMBA), 0.9),   # E4
+    (0.14, note(hz(61), 0.70, MARIMBA), 1.0),   # C#4
+], 0.9))
+

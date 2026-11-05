@@ -19,6 +19,7 @@ The app uses macOS dynamic system colors, so it follows light mode, dark mode an
 - Idle Gray (systemGray: #8E8E93 light, #98989D dark): the badge when sessions are only ready for your reply. Something is there, but nothing is urgent.
 - Badge Numeral (#FFFFFF): the count inside either badge.
 - Secondary Text (secondaryLabelColor: about #6E6E73 light, #98989D dark): captions, helper text and session subtitles.
+- Failed Orange (systemOrange): the icon and caption for a turn that ended with an error, in the menu and in banners. It's the one other alerting color, kept apart from red so "needs you" and "something broke" read differently.
 - Health Green, Orange and Red (systemGreen, systemOrange, systemRed): status icons in Settings → Health only. They never appear in the menu bar.
 - Accent: the user's macOS accent color, through standard controls (toggles, slider, links). The app sets no brand accent of its own.
 
@@ -60,7 +61,7 @@ The app uses macOS dynamic system colors, so it follows light mode, dark mode an
 
 - Emojis anywhere, in the UI, copy or icons.
 - An icon or badge that animates, pulses or bounces. A banner that bounces, loops, or takes focus from the app you're in.
-- A second alerting color, or red for anything except "a session needs your input".
+- Any alerting color beyond red (needs your input) and orange (a turn failed), or red used for anything else.
 - A badge that overlaps the wave.
 - Inter, or any serif font.
 - Neon glows, gradient text, glassmorphism, custom cursors.

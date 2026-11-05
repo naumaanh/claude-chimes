@@ -15,7 +15,19 @@ enum Installer {
     static let wanted: [(String, String, Bool)] = [
         ("Notification", "notification", false), ("Stop", "stop", false),
         ("UserPromptSubmit", "prompt", true), ("PostToolUse", "tool", true), ("SessionEnd", "end", true),
+        ("StopFailure", "failure", false),   // 1.6: a turn ended with an error
+        ("PreCompact", "compact", true),     // 1.6: Claude is about to compact the conversation
     ]
+
+    /// Earlier versions installed fewer hooks. If some of ours are present but not all, the user
+    /// already chose to set up, so bring their hooks up to date (only ours change).
+    static func upgradeIfNeeded() {
+        guard case let .success(settings) = readSettings() else { return }
+        let ourCommands = wanted.flatMap { ev, _, _ in commands(in: settings, event: ev) }.filter { $0.contains(ours) }
+        let legacy = commands(in: settings, event: "Stop").contains { $0.contains(ours) }
+        guard (!ourCommands.isEmpty || legacy), !hooksInstalled(settings) else { return }
+        if (try? install()) != nil { EventLog.append("upgrade hooks-updated-to=\(wanted.count)") }
+    }
 
     struct InstallError: LocalizedError {
         let message: String

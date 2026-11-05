@@ -34,7 +34,7 @@ status_of() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["s
 section "Build"
 BUILD_ARGS=(--no-open --native); [ "${1:-}" = "--universal" ] && BUILD_ARGS=(--no-open)
 if "$ROOT/app/build.sh" "${BUILD_ARGS[@]}" >"$WORK/build.log" 2>&1; then ok "app builds ($(lipo -archs "$BIN"))"; else bad "app builds" "$(tail -20 "$WORK/build.log")"; exit 1; fi
-check "bundles six chimes" '[ "$(ls "$CLAUDE_CHIMES_APP/Contents/Resources/sounds" | wc -l | tr -d " ")" = 6 ]'
+check "bundles seven chimes" '[ "$(ls "$CLAUDE_CHIMES_APP/Contents/Resources/sounds" | wc -l | tr -d " ")" = 7 ]'
 check "bundles the app icon" '[ -f "$CLAUDE_CHIMES_APP/Contents/Resources/AppIcon.icns" ]'
 
 section "Setup keeps settings.json intact"
@@ -44,27 +44,45 @@ check "top-level key order kept" '[ "$(python3 -c "import json,sys; print(list(j
 check "number spelling kept (1.0e3)" 'grep -q "\"ratio\": 1.0e3" "$SETTINGS"'
 check "unrelated hooks kept" 'grep -q "my-guard" "$SETTINGS" && grep -q "echo other-stop" "$SETTINGS"'
 check "1.0 chime.sh hook replaced" '! grep -q "chimes/chime.sh" "$SETTINGS"'
-for ev in notification stop prompt tool end; do
+for ev in notification stop prompt tool end failure compact; do
   check "hook installed: $ev" 'grep -q "chimes/chime-hook '"$ev"'\"" "$SETTINGS"'
 done
-check "background hooks are async" '[ "$(grep -c "\"async\": true" "$SETTINGS")" = 3 ]'
-check "chimes copied to ~/.claude/chimes/sounds" '[ "$(ls "$HOME/.claude/chimes/sounds" | wc -l | tr -d " ")" = 6 ]'
+check "background hooks are async" '[ "$(grep -c "\"async\": true" "$SETTINGS")" = 4 ]'
+check "chimes copied to ~/.claude/chimes/sounds" '[ "$(ls "$HOME/.claude/chimes/sounds" | wc -l | tr -d " ")" = 7 ]'
 cp "$SETTINGS" "$WORK/after-setup.json"
 lim "$BIN" --setup </dev/null >/dev/null
 check "running setup again changes nothing" 'cmp -s "$SETTINGS" "$WORK/after-setup.json"'
 check "doctor passes" 'lim "$HOOK" --doctor </dev/null >/dev/null'
 
 section "Hooks track sessions"
+LOG="$HOME/.claude/chimes/events.log"
+lastlog() { tail -1 "$LOG"; }
+shift_time() { python3 -c 'import json,sys; p=sys.argv[1]; s=json.load(open(p)); s[sys.argv[2]]-=float(sys.argv[3]); json.dump(s,open(p,"w"))' "$SESSIONS/$1.json" "$2" "$3"; }
+hook s1 prompt CLAUDE_CODE_ENTRYPOINT=cli
+check "sending a message marks it working" '[ "$(status_of s1)" = working ]'
 hook s1 notification CLAUDE_CODE_ENTRYPOINT=cli
 check "permission prompt marks needs-input" '[ "$(status_of s1)" = needs-input ]'
 hook s1 tool
-check "a tool run clears the prompt" '! has s1'
+check "a tool run returns it to working" '[ "$(status_of s1)" = working ]'
 hook s1 stop CLAUDE_CODE_ENTRYPOINT=cli
 check "stop marks finished" '[ "$(status_of s1)" = finished ]'
+check "a quick turn skips the Finished chime" 'lastlog | grep -q "chime=skipped-short-turn"'
 echo '{"session_id":"s1","notification_type":"idle_prompt"}' | lim "$HOOK" notification
 check "idle reminder is ignored" '[ "$(status_of s1)" = finished ]'
 hook s1 prompt
-check "replying clears the session" '! has s1'
+shift_time s1 workingSince 120
+hook s1 stop
+check "a long turn plays the Finished chime" 'lastlog | grep -Eq "turn=1[12][0-9]s chime=played"'
+check "turn length is recorded" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"turnSeconds\"] >= 119" "$SESSIONS/s1.json"'
+printf 'quietHours=1\nquietStart=00:00\nquietEnd=23:59\nfinishedMinSeconds=0\n' >> "$HOME/.claude/chimes/config"
+hook s1 stop
+check "quiet hours mute the chime" 'lastlog | grep -q "chime=quiet-hours"'
+sed -i '' -e '/^quietHours=/d' -e '/^quietStart=/d' -e '/^quietEnd=/d' -e '/^finishedMinSeconds=/d' "$HOME/.claude/chimes/config"
+echo '{"session_id":"f1","cwd":"/tmp/f1","error":"API overloaded"}' | lim "$HOOK" failure
+check "a failed turn is recorded with its error" 'python3 -c "import json,sys; s=json.load(open(sys.argv[1])); assert s[\"failed\"] and s[\"message\"]==\"API overloaded\"" "$SESSIONS/f1.json"'
+check "a failed turn plays the error chime" 'lastlog | grep -q "failure session=f1.*chime=played"'
+echo '{"session_id":"k1"}' | lim "$HOOK" compact
+check "the compaction cue is off by default" 'lastlog | grep -q "compact session=k1 chime=off"'
 hook s2 stop; hook s2 end
 check "session end clears it" '! has s2'
 hook d1 stop CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_abc-123
@@ -89,6 +107,8 @@ hook reused stop CLAUDE_PID=$LIVE CLAUDE_CODE_ENTRYPOINT=cli
 python3 - "$SESSIONS/reused.json" <<'PY'
 import json, sys; p = sys.argv[1]; s = json.load(open(p)); s["pidStart"] -= 1000; json.dump(s, open(p, "w"))
 PY
+hook idle-work prompt CLAUDE_CODE_ENTRYPOINT=cli
+shift_time idle-work updatedAt 3600
 KEPT="$(lim "$HOOK" --list-sessions </dev/null | cut -f2 | sort | tr '\n' ' ')"
 check "keeps live, desktop and no-PID sessions; drops dead and reused" '[ "$KEPT" = "desk-dea needs-li no-pid " ]'
 { kill $LIVE; wait $LIVE; } 2>/dev/null; rm -f "$SESSIONS"/*.json

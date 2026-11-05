@@ -32,16 +32,18 @@ final class BannerView: NSView {
         blur.autoresizingMask = [.width, .height]
         addSubview(blur)
 
-        let needs = s.status == .needsInput
+        let needs = s.status == .needsInput, failed = s.isFailed
         let icon = NSImageView(frame: NSRect(x: 14, y: (Self.size.height - 22) / 2, width: 22, height: 22))
-        icon.image = NSImage(systemSymbolName: needs ? "exclamationmark.bubble.fill" : "checkmark.bubble.fill",
+        icon.image = NSImage(systemSymbolName: needs ? "exclamationmark.bubble.fill"
+                                : failed ? "exclamationmark.triangle.fill" : "checkmark.bubble.fill",
                              accessibilityDescription: nil)
         icon.symbolConfiguration = .init(pointSize: 17, weight: .regular)
-        icon.contentTintColor = needs ? .systemRed : .secondaryLabelColor
+        let tint: NSColor = needs ? .systemRed : failed ? .systemOrange : .secondaryLabelColor
+        icon.contentTintColor = tint
 
-        let caption = NSTextField(labelWithString: needs ? "Needs your input" : "Ready for your reply")
+        let caption = NSTextField(labelWithString: needs ? "Needs your input" : failed ? "Turn failed" : "Ready for your reply")
         caption.font = .systemFont(ofSize: 11, weight: .medium)
-        caption.textColor = needs ? .systemRed : .secondaryLabelColor
+        caption.textColor = tint
         caption.frame = NSRect(x: 46, y: 42, width: 250, height: 14)
 
         let title = NSTextField(labelWithString: s.title)
@@ -49,7 +51,9 @@ final class BannerView: NSView {
         title.lineBreakMode = .byTruncatingTail
         title.frame = NSRect(x: 46, y: 24, width: 250, height: 17)
 
-        let detail = NSTextField(labelWithString: needs ? (s.message ?? "Claude is waiting for you") : "Claude finished a reply")
+        let finishedText = s.turnSeconds.map { "Claude finished a reply after \(BannerView.duration($0))" } ?? "Claude finished a reply"
+        let detail = NSTextField(labelWithString: needs ? (s.message ?? "Claude is waiting for you")
+                                 : failed ? (s.message ?? "Claude hit an error") : finishedText)
         detail.font = .systemFont(ofSize: 12)
         detail.textColor = .secondaryLabelColor
         detail.lineBreakMode = .byTruncatingTail
@@ -77,6 +81,14 @@ final class BannerView: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    /// "45 s", "3 min", "1 hr 5 min".
+    static func duration(_ seconds: Double) -> String {
+        let s = Int(seconds.rounded())
+        if s < 60 { return "\(s) s" }
+        if s < 3600 { return "\(s / 60) min" }
+        return "\(s / 3600) hr" + (s % 3600 >= 60 ? " \((s % 3600) / 60) min" : "")
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()

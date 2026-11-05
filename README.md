@@ -12,13 +12,17 @@ Claude Chimes plays a soft chime when Claude needs your input (a permission prom
 
 ## Features
 
-The six chimes are synthesized on your Mac by a small Python script, so nothing is downloaded:
+The chimes are synthesized on your Mac by a small Python script, so nothing is downloaded:
 
 | Needs input | Finished |
 | --- | --- |
 | Nudge: two soft marimba notes, rising | Spark: a quick sparkle into a warm chord |
 | Query: three glassy bell notes, unresolved | Settle: three descending kalimba notes |
 | Knock: two muted wooden taps | Bloom: a slow, warm chord that rings out |
+
+A seventh, Dip (two low marimba notes stepping down), plays when a turn fails.
+
+By default the Finished chime only plays when Claude worked for more than 30 seconds, so quick replies stay quiet. A prompt you leave unanswered gets one reminder after 5 minutes, and quiet hours can mute everything overnight.
 
 The menu bar lists the sessions waiting on you. Some need your input, with the question they're asking; others have finished and are ready for your reply. A badge next to the icon counts them, red when something needs you and gray when sessions are only waiting for a reply. Clicking a desktop-app chat opens it, and clicking a CLI session brings your terminal to the front.
 
@@ -77,9 +81,10 @@ A session leaves the list when you reply, approve the tool it asked about, or cl
   <img src="docs/settings.png" alt="The Settings window" width="420">
 </p>
 
-The Settings window has six sections:
+The Settings window has seven sections:
 
-- Sounds: the Needs input and Finished sounds, each with a play button.
+- Sounds: the Needs input, Finished and Turn failed sounds, each with a play button.
+- When to Chime: how long a turn must run before Finished chimes (every reply, or after 15 seconds up to 5 minutes), the reminder for an unanswered prompt (off, or after 2 to 15 minutes), an optional cue before Claude compacts the conversation, and quiet hours.
 - Volume: the slider and Mute.
 - Menu Bar: what the badge counts (Needs input and finished, Needs input only, or Off) and whether finished sessions are listed.
 - Banners: which sessions pop up a banner (needs input and finished, needs input only, or off), where it appears (top right, top center or bottom right), and how long it stays (4, 8 or 15 seconds, or until you dismiss it), plus a Show Test Banner button. Clicking a banner opens the session, and its × dismisses it. A banner waits while your pointer is over it, and closes by itself once you reply.
@@ -95,6 +100,13 @@ input=/Users/you/.claude/chimes/sounds/input-nudge.wav
 done=/Users/you/.claude/chimes/sounds/done-spark.wav
 volume=0.40
 muted=0
+error=/Users/you/.claude/chimes/sounds/error-dip.wav
+finishedMinSeconds=30
+reminderMinutes=5
+compactChime=0
+quietHours=0
+quietStart=22:00
+quietEnd=08:00
 badge=all
 showFinished=1
 banner=all
@@ -108,10 +120,12 @@ Claude Code runs [hooks](https://docs.claude.com/en/docs/claude-code/hooks) on l
 
 | Hook | Argument | What it does |
 | --- | --- | --- |
+| `UserPromptSubmit` | `prompt` | You sent a message, so the session is working and the turn's clock starts. Runs in the background. |
 | `Notification` | `notification` | Plays the Needs input chime and marks the session as needing you. Idle reminders are skipped. |
-| `Stop` | `stop` | Plays the Finished chime and marks the session as ready for your reply. |
-| `UserPromptSubmit` | `prompt` | You replied, so the session is cleared. Runs in the background. |
-| `PostToolUse` | `tool` | A tool ran, so a pending permission prompt was answered. Runs in the background. |
+| `PostToolUse` | `tool` | A tool ran, so a pending permission prompt was answered and the session is working again. Runs in the background. |
+| `Stop` | `stop` | Marks the session as ready for your reply, and plays the Finished chime if the turn ran longer than your threshold. |
+| `StopFailure` | `failure` | The turn ended with an error. Plays the Turn failed chime and marks the session as failed. |
+| `PreCompact` | `compact` | Claude is about to compact the conversation. Plays a cue if you turned that on. Runs in the background. |
 | `SessionEnd` | `end` | The session closed, so it's cleared. Runs in the background. |
 
 `chime-hook` is the menu bar app's own binary running in hook mode. It plays sounds with `afplay` in the background, so Claude is never kept waiting, and a call takes about 15 ms.
