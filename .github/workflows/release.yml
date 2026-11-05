@@ -1,0 +1,57 @@
+name: Release
+
+# Push a version tag (for example v1.4.0) to build the app and publish a GitHub release
+# with a zip attached. The release notes come from that version's section of CHANGELOG.md.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches the app version
+        run: |
+          app_version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" app/Info.plist)
+          if [ "v$app_version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME doesn't match app/Info.plist version $app_version" >&2
+            exit 1
+          fi
+
+      - name: Test
+        run: tests/run.sh --universal
+
+      - name: Build
+        run: |
+          export CLAUDE_CHIMES_APP="$RUNNER_TEMP/Claude Chimes.app"
+          app/build.sh --no-open
+          ditto -c -k --keepParent "$CLAUDE_CHIMES_APP" "$RUNNER_TEMP/ClaudeChimes-${GITHUB_REF_NAME#v}.zip"
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            /^## / { if (found) exit; if (index($0, "[" v "]") || index($0, " " v)) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          cat >> "$RUNNER_TEMP/notes.md" <<'NOTES'
+
+          ### Installing the download
+          1. Unzip and move **Claude Chimes.app** to Applications.
+          2. Open it. macOS will say it can't verify the developer, because the app isn't notarized.
+             Open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**.
+             (Or run `xattr -dr com.apple.quarantine "/Applications/Claude Chimes.app"`.)
+          3. Click **Set Up** in the welcome window.
+          NOTES
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP/ClaudeChimes-${GITHUB_REF_NAME#v}.zip" \
+            --title "Claude Chimes ${GITHUB_REF_NAME#v}" --notes-file "$RUNNER_TEMP/notes.md"

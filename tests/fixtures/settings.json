@@ -1,0 +1,47 @@
+{
+  "model": "opus",
+  "cleanupPeriodDays": 30,
+  "ratio": 1.0e3,
+  "statusLine": {
+    "type": "command",
+    "command": "echo \"café ✓\" \\ tab\there"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "my-guard"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo other-stop"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/chimes/chime.sh done",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "env": {
+    "EMOJI": "😀",
+    "EMPTY": {},
+    "LIST": []
+  },
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)"
+    ]
+  }
+}

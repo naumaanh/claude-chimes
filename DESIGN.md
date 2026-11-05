@@ -31,10 +31,13 @@ The app uses macOS dynamic system colors, so it follows light mode, dark mode an
 ## 4. Component stylings
 
 - Menu bar icon: an 18×18 pt template image. When there's a count, a pill badge 12 pt tall sits 2 pt to the right of the wave, never on top of it. An earlier overlapping badge cut into the wave and was dropped. Above nine, show "9+".
-- Menu: a native NSMenu, rebuilt each time it opens. Only sections with content are shown. When nothing is waiting, it shows a single disabled line, "Nothing waiting on you". Session rows are the title on the first line, then a subtitle with the prompt message and a relative time ("just now", "4 min ago").
+- Menu: a native NSMenu, rebuilt each time it opens. Only sections with content are shown. When nothing is waiting, it shows a single disabled line, "Nothing waiting on you". Session rows are the title on the first line, then a subtitle with the prompt message and a relative time ("just now", "4 min ago"). The icon is red for needs-input sessions and gray for finished ones. A faint × at the end of each row dismisses that session without closing the menu. The row draws the native rounded selection on hover and switches to the selected-menu text colors, and VoiceOver gets Open as the press action and Dismiss as a custom action.
 - Volume slider (in the menu and in Settings): previews the Finished sound once, when you let go, never while dragging.
 - Settings window: a SwiftUI grouped Form, 500 pt wide, with its position remembered between launches. Each sound row is the label with a caption, then a 150 pt picker, then a borderless play button. Choosing a sound plays it once. Reloading settings from disk never plays anything.
 - Health rows: a status icon, then the title with a one-line caption saying what's wrong and what to do. Repair is enabled only when a check fails or the link points at another copy. Status messages under the buttons clear after 4 to 8 seconds.
+- App icon: the same sine wave in off-white (#F5F5F7) on a charcoal rounded square (#1B1B1E), following the macOS icon grid: an 824-of-1024 tile, a 185 px corner radius, a soft drop shadow, and a faint top light. It's drawn in code (`AppIcon.swift`), so it stays in step with the menu bar icon.
+- Welcome window: 440 pt wide. It shows the icon and name, one paragraph on what the app does, and an exact list of what setup will change, then Not Now and Set Up (the default button). After setup it shows the two things to do next. It never sets anything up without a click.
+- Uninstall: a confirmation alert with a destructive Uninstall button, a checkbox to also delete sounds and settings (off by default), and the app moved to the Trash rather than deleted.
 - Empty, error and loading states: the menu's empty line and Health's warnings are the empty and error states. Nothing takes long enough to need a loader.
 
 ## 5. Layout principles

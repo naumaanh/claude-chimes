@@ -346,48 +346,24 @@ struct HealthCheck: Identifiable {
 }
 
 enum Health {
-    static let settingsURL = homeDir.appendingPathComponent(".claude/settings.json")
-    static let hookLink = chimesDir.appendingPathComponent("chime-hook")
-    static let ours = "/.claude/chimes/chime"
-    /// (hook event, chime-hook argument, runs in the background)
-    static let wanted: [(String, String, Bool)] = [
-        ("Notification", "notification", false), ("Stop", "stop", false),
-        ("UserPromptSubmit", "prompt", true), ("PostToolUse", "tool", true), ("SessionEnd", "end", true),
-    ]
-
-    /// The binary the hook link should point at: this app's own executable.
-    static var appBinary: URL? { appBundle.executableURL?.resolvingSymlinksInPath() }
-
-    static func readSettings() -> (json: [String: Any]?, error: String?) {
-        guard let data = try? Data(contentsOf: settingsURL) else { return (nil, "~/.claude/settings.json not found") }
-        if data.allSatisfy({ $0 == 0x20 || $0 == 0x0A || $0 == 0x09 || $0 == 0x0D }) { return ([:], nil) }
-        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return (nil, "~/.claude/settings.json isn't valid JSON, so Claude Code may be ignoring it")
-        }
-        return (obj, nil)
-    }
-
-    static func commands(in settings: [String: Any], event: String) -> [String] {
-        let groups = (settings["hooks"] as? [String: Any])?[event] as? [[String: Any]] ?? []
-        return groups.flatMap { ($0["hooks"] as? [[String: Any]] ?? []).compactMap { $0["command"] as? String } }
-    }
+    static var hookLink: URL { Installer.hookLink }
+    static var appBinary: URL? { Installer.appBinary }
 
     static func run(config: Config) -> [HealthCheck] {
         var out: [HealthCheck] = []
-        let (settings, error) = readSettings()
-
-        if let error {
-            out.append(.init(id: "settings", level: .fail, title: "Claude Code settings", detail: error))
-        } else if let settings {
-            if settings["disableAllHooks"] as? Bool == true {
+        switch Installer.readSettings() {
+        case .failure(let error):
+            out.append(.init(id: "settings", level: .fail, title: "Claude Code settings", detail: error.message))
+        case .success(let settings):
+            if settings["disableAllHooks"]?.bool == true {
                 out.append(.init(id: "disabled", level: .fail, title: "Hooks are turned off",
                                  detail: "\"disableAllHooks\" is true in ~/.claude/settings.json, so no chimes will play."))
             }
-            let missing = wanted.filter { ev, arg, _ in
-                !commands(in: settings, event: ev).contains { $0.contains("chimes/chime-hook \(arg)") }
+            let missing = Installer.wanted.filter { ev, arg, _ in
+                !Installer.commands(in: settings, event: ev).contains { $0.contains("chimes/chime-hook \(arg)") }
             }.map(\.0)
             out.append(missing.isEmpty
-                ? .init(id: "hooks", level: .ok, title: "Claude Code hooks", detail: "All \(wanted.count) hooks are installed.")
+                ? .init(id: "hooks", level: .ok, title: "Claude Code hooks", detail: "All \(Installer.wanted.count) hooks are installed.")
                 : .init(id: "hooks", level: .fail, title: "Claude Code hooks", detail: "Missing: \(missing.joined(separator: ", ")). Repair adds them back."))
         }
 
@@ -425,49 +401,8 @@ enum Health {
         return out
     }
 
-    /// Relinks chime-hook to this app and writes the hooks back into ~/.claude/settings.json
-    /// (after a timestamped backup). Other settings and hooks are kept.
-    static func repair() throws {
-        let fm = FileManager.default
-        try fm.createDirectory(at: chimesDir, withIntermediateDirectories: true)
-        if let app = appBinary {
-            try? fm.removeItem(at: hookLink)
-            try fm.createSymbolicLink(at: hookLink, withDestinationURL: app)
-        }
-
-        var (settings, error) = readSettings()
-        if settings == nil {
-            if fm.fileExists(atPath: settingsURL.path) { throw NSError(domain: "ClaudeChimes", code: 1,
-                userInfo: [NSLocalizedDescriptionKey: (error ?? "Unreadable settings") + ". Fix the file by hand, then try again."]) }
-            settings = [:]
-        }
-        var json = settings!
-        if fm.fileExists(atPath: settingsURL.path) {
-            let stamp = DateFormatter.backupStamp.string(from: Date())
-            try? fm.copyItem(at: settingsURL, to: settingsURL.appendingPathExtension("bak-chimes-\(stamp)"))
-        }
-
-        var hooks = json["hooks"] as? [String: Any] ?? [:]
-        for (event, value) in hooks {
-            let groups = (value as? [[String: Any]] ?? []).compactMap { group -> [String: Any]? in
-                let kept = (group["hooks"] as? [[String: Any]] ?? []).filter { !(($0["command"] as? String ?? "").contains(ours)) }
-                guard !kept.isEmpty else { return nil }
-                var g = group; g["hooks"] = kept; return g
-            }
-            hooks[event] = groups.isEmpty ? nil : groups
-        }
-        for (event, arg, background) in wanted {
-            var hook: [String: Any] = ["type": "command", "command": "~/.claude/chimes/chime-hook \(arg)", "timeout": 5]
-            if background { hook["async"] = true }
-            hooks[event] = (hooks[event] as? [[String: Any]] ?? []) + [["hooks": [hook]]]
-        }
-        json["hooks"] = hooks
-
-        let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
-        try fm.createDirectory(at: settingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try (data + Data("\n".utf8)).write(to: settingsURL, options: .atomic)
-        EventLog.append("repair hooks-rewritten link=\(appBinary?.path ?? "-")")
-    }
+    /// Relinks chime-hook, re-adds the hooks and restores any missing bundled sounds.
+    static func repair() throws { try Installer.install() }
 
     /// Quietly fixes the hook link at launch (for example after the app was moved).
     /// Never touches settings.json without the user asking.
@@ -690,6 +625,9 @@ struct SettingsView: View {
                 }
                 Text("Drop any .wav, .aiff, .mp3, .m4a or .caf file into the sounds folder to add it to the lists.")
                     .font(.caption).foregroundStyle(.secondary)
+                LabeledContent("Remove Claude Chimes") {
+                    Button("Uninstall…", role: .destructive) { Uninstall.run() }
+                }
             }
 
             Section("Health") {
@@ -794,6 +732,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let model = AppModel()
     var statusItem: NSStatusItem!
     var settingsWindow: NSWindow?
+    var welcomeWindow: NSWindow?
     weak var volumeLabel: NSTextField?
     var watcher: DispatchSourceFileSystemObject?
     var refreshTimer: Timer?
@@ -808,8 +747,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
 
         if !FileManager.default.fileExists(atPath: configURL.path) { model.config.save() }
+        // Restore the bundled chimes if the sounds folder is gone (a fresh download, or it was deleted).
+        if soundFiles(in: soundsDir).isEmpty { Installer.seedSounds() }
         model.onChange = { [weak self] in self?.updateStatusButton() }
         Health.relinkIfNeeded()
+        if Welcome.shouldShow { showWelcome() }
         watchSessions()
         model.reloadSessions()
         model.refreshHealth()
@@ -825,7 +767,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func watchSessions() {
         try? FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
-        let fd = open(sessionsDir.path, O_EVTONLY)
+        let fd = Darwin.open(sessionsDir.path, O_EVTONLY)
         guard fd >= 0 else { return }
         let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .delete, .rename], queue: .main)
         src.setEventHandler { [weak self] in MainActor.assumeIsolated { self?.model.reloadSessions() } }
@@ -858,6 +800,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         model.reloadConfig()
         model.reloadSessions()
         model.refreshHealth()
+        build(menu)
+    }
+
+    /// Fills the menu from the model. Also called while the menu is open, after a session is dismissed.
+    func build(_ menu: NSMenu) {
         menu.removeAllItems()
 
         let needs = model.needsInput
@@ -879,7 +826,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if !needs.isEmpty { menu.addItem(NSMenuItem.sectionHeader(title: "Needs Your Input")) }
         for s in needs.prefix(10) {
-            menu.addItem(sessionItem(s, symbol: "exclamationmark.bubble.fill",
+            menu.addItem(sessionItem(s, symbol: "exclamationmark.bubble.fill", tint: .systemRed,
                                      detail: [s.message, ago(s.updatedAt)].compactMap { $0 }.joined(separator: " · ")))
         }
 
@@ -907,13 +854,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Date().timeIntervalSince(date) < 45 ? "just now" : relative.localizedString(for: date, relativeTo: Date())
     }
 
-    func sessionItem(_ s: SessionState, symbol: String, detail: String) -> NSMenuItem {
-        let i = item(s.title, #selector(openSession(_:)))
+    /// A session row: click to open it, or click its × to dismiss it when you're done.
+    func sessionItem(_ s: SessionState, symbol: String, tint: NSColor = .secondaryLabelColor, detail: String) -> NSMenuItem {
+        let i = NSMenuItem(title: s.title, action: nil, keyEquivalent: "")
         i.representedObject = s
-        i.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         i.toolTip = s.cwd
-        if #available(macOS 14.4, *) { i.subtitle = detail } else { i.title = "\(s.title) (\(detail))" }
+        i.view = SessionRowView(title: s.title, subtitle: detail, symbol: symbol, iconTint: tint,
+                                onOpen: { [weak self] in self?.open(s) },
+                                onDismiss: { [weak self, weak i] in self?.dismiss(s, in: i?.menu) })
         return i
+    }
+
+    /// Removes one session from the list (you're done with it) and redraws the open menu.
+    func dismiss(_ s: SessionState, in menu: NSMenu?) {
+        Sessions.remove(s.id)
+        EventLog.append("dismiss session=\(s.id.prefix(8)) status=\(s.status.rawValue)")
+        model.reloadSessions()
+        if let menu { build(menu) }
     }
 
     func item(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
@@ -960,8 +917,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Opens the session: desktop chats open directly via the Claude app's `claude://code/continue` link;
     /// CLI sessions (and older entries without a desktop ID) bring their app to the front.
-    @objc func openSession(_ sender: NSMenuItem) {
-        guard let s = sender.representedObject as? SessionState else { return }
+    func open(_ s: SessionState) {
         if let link = s.desktopLink, NSWorkspace.shared.open(link) {
             EventLog.append("open session=\(s.id.prefix(8)) via=desktop-link")
             return
@@ -972,6 +928,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
             NSWorkspace.shared.openApplication(at: url, configuration: .init())
         }
+    }
+
+    func showWelcome() {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 300),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        w.title = "Welcome to Claude Chimes"
+        w.isReleasedWhenClosed = false
+        w.contentView = NSHostingView(rootView: WelcomeView(
+            onSetUp: { [weak self] in
+                try Installer.install()
+                self?.model.reloadConfig()
+                self?.model.refreshHealth()
+            },
+            onClose: { [weak self] skipped in
+                if skipped { UserDefaults.standard.set(true, forKey: Welcome.skippedKey) }
+                self?.welcomeWindow?.close()
+                self?.welcomeWindow = nil
+            }))
+        w.center()
+        welcomeWindow = w
+        NSApp.activate()
+        w.makeKeyAndOrderFront(nil)
     }
 
     @objc func openSettings() {
@@ -1006,17 +984,37 @@ if let i = args.firstIndex(of: "--hook") {
     runHook(i + 1 < args.count ? args[i + 1] : "")
 }
 // Command-line helpers (also handy when filing an issue):
+//   --setup           copy the chimes, link chime-hook to this binary and add the hooks (install.sh runs this)
+//   --repair          same as --setup
+//   --uninstall       remove the hooks, the link and session state (add --delete-data to remove sounds and config)
 //   --doctor          print the health check; exits 1 if anything fails
-//   --repair          relink chime-hook to this binary and re-add the hooks
 //   --list-sessions   print the sessions currently waiting on you (pruning stale ones)
+//   --dismiss <id>    remove one session from the list (the full ID, or a unique prefix of it)
 if args.contains("--doctor") {
     let checks = Health.run(config: Config.load())
     print(Health.diagnostics(config: Config.load(), checks: checks, sessions: Sessions.all()))
     exit(checks.contains { $0.level == .fail } ? 1 : 0)
 }
-if args.contains("--repair") {
-    do { try Health.repair(); print("Repaired. Restart open Claude sessions to load the hooks.") }
-    catch { FileHandle.standardError.write(Data("Repair failed: \(error.localizedDescription)\n".utf8)); exit(1) }
+if args.contains("--setup") || args.contains("--repair") {
+    do { try Installer.install(); print("Claude Chimes is set up. Restart open Claude sessions to load the hooks.") }
+    catch { FileHandle.standardError.write(Data("Setup failed: \(error.localizedDescription)\n".utf8)); exit(1) }
+    exit(0)
+}
+if args.contains("--uninstall") {
+    do { try Installer.uninstall(deleteData: args.contains("--delete-data")); print("Claude Chimes hooks removed.") }
+    catch { FileHandle.standardError.write(Data("Uninstall failed: \(error.localizedDescription)\n".utf8)); exit(1) }
+    exit(0)
+}
+if let i = args.firstIndex(of: "--dismiss") {
+    let wanted = i + 1 < args.count ? args[i + 1] : ""
+    let matches = Sessions.all().filter { !wanted.isEmpty && $0.id.hasPrefix(wanted) }
+    guard matches.count == 1, let s = matches.first else {
+        FileHandle.standardError.write(Data("\(matches.isEmpty ? "No session matches" : "More than one session matches") '\(wanted)'.\n".utf8))
+        exit(1)
+    }
+    Sessions.remove(s.id)
+    EventLog.append("dismiss session=\(s.id.prefix(8)) status=\(s.status.rawValue) via=cli")
+    print("Dismissed \(s.title)")
     exit(0)
 }
 if args.contains("--list-sessions") {
@@ -1029,6 +1027,12 @@ if args.contains("--list-sessions") {
 // Used by uninstall.sh to remove the login item before the app is deleted.
 if args.contains("--disable-login-item") {
     try? SMAppService.mainApp.unregister()
+    exit(0)
+}
+
+// `ClaudeChimes --render-app-icon dir.iconset` writes the app icon at every size (see AppIcon.swift).
+if let i = args.firstIndex(of: "--render-app-icon"), i + 1 < args.count {
+    AppIcon.renderIconset(to: args[i + 1])
     exit(0)
 }
 
@@ -1060,6 +1064,64 @@ if let i = args.firstIndex(of: "--snapshot-icons"), i + 1 < args.count {
             }
         }
         try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: args[i + 1]))
+    }
+    exit(0)
+}
+
+// `ClaudeChimes --snapshot-welcome out.png [--done]` renders the first-run welcome window.
+if let i = args.firstIndex(of: "--snapshot-welcome"), i + 1 < args.count {
+    MainActor.assumeIsolated {
+        _ = NSApplication.shared
+        let m = WelcomeModel()
+        if args.contains("--done") { m.step = .done }
+        let view = NSHostingView(rootView: WelcomeView(model: m, onSetUp: {}, onClose: { _ in })
+            .background(Color(nsColor: .windowBackgroundColor)))
+        let size = view.fittingSize
+        let window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.titled], backing: .buffered, defer: false)
+        window.appearance = NSAppearance(named: args.contains("--dark") ? .darkAqua : .aqua)
+        window.contentView = view
+        view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+        if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+            view.cacheDisplay(in: view.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: args[i + 1]))
+        }
+    }
+    exit(0)
+}
+
+// `ClaudeChimes --snapshot-rows out.png [--dark]` renders session rows (one hovered) as they look in the menu.
+if let i = args.firstIndex(of: "--snapshot-rows"), i + 1 < args.count {
+    MainActor.assumeIsolated {
+        _ = NSApplication.shared
+        let dark = args.contains("--dark")
+        let rows = [
+            SessionRowView(title: "Fix the login redirect", subtitle: "Claude needs your permission to use Bash · just now",
+                           symbol: "exclamationmark.bubble.fill", iconTint: .systemRed, onOpen: {}, onDismiss: {}),
+            SessionRowView(title: "Write the release notes", subtitle: "Finished 4 min ago", symbol: "checkmark.bubble", onOpen: {}, onDismiss: {}),
+            SessionRowView(title: "Refactor the settings parser", subtitle: "Finished 12 min ago", symbol: "checkmark.bubble", onOpen: {}, onDismiss: {}),
+        ]
+        let w: CGFloat = 320, h = CGFloat(rows.count) * SessionRowView.height + 12
+        let panel = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        for (n, r) in rows.enumerated() {
+            r.frame = NSRect(x: 0, y: h - 6 - CGFloat(n + 1) * SessionRowView.height, width: w, height: SessionRowView.height)
+            r.setHovering(n == 1)
+            panel.addSubview(r)
+        }
+        let window = NSWindow(contentRect: panel.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+        window.backgroundColor = dark ? NSColor(white: 0.17, alpha: 1) : NSColor(white: 0.96, alpha: 1)
+        window.contentView = panel
+        panel.wantsLayer = true
+        panel.layer?.backgroundColor = window.backgroundColor.cgColor
+        panel.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        window.appearance!.performAsCurrentDrawingAppearance {
+            if let rep = panel.bitmapImageRepForCachingDisplay(in: panel.bounds) {
+                panel.cacheDisplay(in: panel.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: args[i + 1]))
+            }
+        }
     }
     exit(0)
 }
