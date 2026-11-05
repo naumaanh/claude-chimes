@@ -36,6 +36,7 @@ The app uses macOS dynamic system colors, so it follows light mode, dark mode an
 - Settings window: a SwiftUI grouped Form, 500 pt wide, with its position remembered between launches. Each sound row is the label with a caption, then a 150 pt picker, then a borderless play button. Choosing a sound plays it once. Reloading settings from disk never plays anything.
 - Health rows: a status icon, then the title with a one-line caption saying what's wrong and what to do. Repair is enabled only when a check fails or the link points at another copy. Status messages under the buttons clear after 4 to 8 seconds.
 - App icon: the same sine wave in off-white (#F5F5F7) on a charcoal rounded square (#1B1B1E), following the macOS icon grid: an 824-of-1024 tile, a 185 px corner radius, a soft drop shadow, and a faint top light. It's drawn in code (`AppIcon.swift`), so it stays in step with the menu bar icon.
+- Banner: a 340×66 pt card with a frosted popover material, a 14 pt corner radius, a hairline separator border and a system shadow. It shows a caption ("Needs your input" in red, or "Ready for your reply" in gray), the session title in 13 pt semibold, and one detail line, with a faint × on the right. It floats at menu bar level on every Space without taking focus, 12 pt from the screen edge, and up to three stack 8 pt apart, newest nearest the edge.
 - Welcome window: 440 pt wide. It shows the icon and name, one paragraph on what the app does, and an exact list of what setup will change, then Not Now and Set Up (the default button). After setup it shows the two things to do next. It never sets anything up without a click.
 - Uninstall: a confirmation alert with a destructive Uninstall button, a checkbox to also delete sounds and settings (off by default), and the app moved to the Trash rather than deleted.
 - Empty, error and loading states: the menu's empty line and Health's warnings are the empty and error states. Nothing takes long enough to need a loader.
@@ -50,6 +51,7 @@ The app uses macOS dynamic system colors, so it follows light mode, dark mode an
 ## 6. Motion and interaction
 
 - No animation in the menu bar icon, the badge, or the menu. Users see them dozens of times a day, and at that frequency motion makes the interface feel slow and distracting.
+- Banners are the one exception: they're occasional, so they enter with opacity plus an 8 pt slide (ease-out `cubic-bezier(0.23, 1, 0.32, 1)`, 200 ms) and leave faster (fade, 150 ms). Stacked banners reflow with ease-in-out. With Reduce Motion on they only fade. The timer pauses while the pointer is over a banner.
 - Sound is the app's motion. The chimes are the only time-based feedback, and each one plays once, never on a loop.
 - Feedback should be immediate. A picker change plays its sound at once, the badge updates the moment a hook writes its file, and a press gives the standard control response.
 - A project page may use restrained entrance motion (opacity plus about 8 px of translate, ease-out, under 300 ms, staggered 50 ms between items), and must honor `prefers-reduced-motion`. No perpetual loops, no scroll hijacking.
@@ -57,7 +59,7 @@ The app uses macOS dynamic system colors, so it follows light mode, dark mode an
 ## 7. Anti-patterns (banned)
 
 - Emojis anywhere, in the UI, copy or icons.
-- An icon or badge that animates, pulses or bounces.
+- An icon or badge that animates, pulses or bounces. A banner that bounces, loops, or takes focus from the app you're in.
 - A second alerting color, or red for anything except "a session needs your input".
 - A badge that overlaps the wave.
 - Inter, or any serif font.

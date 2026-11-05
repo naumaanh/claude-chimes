@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.5.0] - 2026-11-05
+
+### Added
+- On-screen banners. When a session needs your input or finishes, a small card names the session and what it's waiting for. Click it to open the session, or × to dismiss it. A banner waits while your pointer is over it, and closes by itself once you reply. Up to three stack at once.
+- Settings → Banners: which sessions show a banner (needs input and finished, needs input only, or off), where it appears (top right, top center or bottom right), how long it stays (4, 8 or 15 seconds, or until dismissed), and Show Test Banner.
+
 ## [1.4.1] - 2026-11-05
 
 ### Fixed

@@ -41,6 +41,21 @@ struct Config: Equatable {
     var muted = false
     var badge = Badge.all     // what the number badge on the menu bar icon counts
     var showFinished = true   // list sessions that finished and are waiting for your reply
+    var banner = Badge.all    // which sessions pop up an on-screen banner (same three choices as the badge)
+    var bannerPosition = BannerPosition.topRight
+    var bannerSeconds = 8     // 0 keeps a banner until you dismiss it
+
+    enum BannerPosition: String, CaseIterable, Identifiable {
+        case topRight, topCenter, bottomRight
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .topRight: return "Top right"
+            case .topCenter: return "Top center"
+            case .bottomRight: return "Bottom right"
+            }
+        }
+    }
 
     enum Badge: String, CaseIterable, Identifiable {
         case all, input, off
@@ -70,6 +85,9 @@ struct Config: Equatable {
             case "badge": c.badge = Badge(rawValue: v) ?? c.badge
             case "showCount": if !on { c.badge = .off }   // 1.1 setting; replaced by badge
             case "showFinished": c.showFinished = on
+            case "banner": c.banner = Badge(rawValue: v) ?? c.banner
+            case "bannerPosition": c.bannerPosition = BannerPosition(rawValue: v) ?? c.bannerPosition
+            case "bannerSeconds": c.bannerSeconds = max(0, min(120, Int(v) ?? c.bannerSeconds))
             default: break
             }
         }
@@ -85,6 +103,9 @@ struct Config: Equatable {
         muted=\(muted ? 1 : 0)
         badge=\(badge.rawValue)
         showFinished=\(showFinished ? 1 : 0)
+        banner=\(banner.rawValue)
+        bannerPosition=\(bannerPosition.rawValue)
+        bannerSeconds=\(bannerSeconds)
 
         """
         try? FileManager.default.createDirectory(at: chimesDir, withIntermediateDirectories: true)
@@ -504,8 +525,13 @@ final class AppModel: ObservableObject {
         flash("Diagnostics copied to the clipboard.")
     }
 
+    var onSessionsChanged: ((_ old: [SessionState], _ new: [SessionState]) -> Void)?
+    var onTestBanner: (() -> Void)?
+
     func reloadSessions() {
+        let old = sessions
         sessions = Sessions.all()
+        onSessionsChanged?(old, sessions)
         onChange?()
     }
 
@@ -612,6 +638,29 @@ struct SettingsView: View {
                 Text("Red when a session needs your input, gray when sessions are only waiting for your reply.")
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("List sessions ready for your reply", isOn: $model.config.showFinished)
+            }
+
+            Section("Banners") {
+                Picker("Show a banner for", selection: $model.config.banner) {
+                    ForEach(Config.Badge.allCases) { Text($0.label).tag($0) }
+                }
+                Picker("Position", selection: $model.config.bannerPosition) {
+                    ForEach(Config.BannerPosition.allCases) { Text($0.label).tag($0) }
+                }
+                Picker("Hide after", selection: $model.config.bannerSeconds) {
+                    Text("4 seconds").tag(4)
+                    Text("8 seconds").tag(8)
+                    Text("15 seconds").tag(15)
+                    Text("Until dismissed").tag(0)
+                }
+                .disabled(model.config.banner == .off)
+                HStack {
+                    Text("A banner names the session and what it's waiting for. Click it to open the session, or × to dismiss it.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Show Test Banner") { model.onTestBanner?() }
+                        .disabled(model.config.banner == .off)
+                }
             }
 
             Section("General") {
@@ -730,6 +779,7 @@ enum StatusIcon {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let model = AppModel()
+    let banners = BannerCenter()
     var statusItem: NSStatusItem!
     var settingsWindow: NSWindow?
     var welcomeWindow: NSWindow?
@@ -750,6 +800,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Restore the bundled chimes if the sounds folder is gone (a fresh download, or it was deleted).
         if soundFiles(in: soundsDir).isEmpty { Installer.seedSounds() }
         model.onChange = { [weak self] in self?.updateStatusButton() }
+        banners.config = { [weak self] in self?.model.config ?? Config.load() }
+        banners.onOpen = { [weak self] s in self?.open(s) }
+        banners.onDismiss = { [weak self] s in if s.id != "test-banner" { self?.dismiss(s, in: nil) } }
+        model.onTestBanner = { [weak self] in self?.showTestBanner() }
+        // Sessions already waiting at launch are the baseline: no burst of banners on startup.
+        model.reloadSessions()
+        model.onSessionsChanged = { [weak self] old, new in self?.sessionsChanged(old: old, new: new) }
         Health.relinkIfNeeded()
         if Welcome.shouldShow { showWelcome() }
         watchSessions()
@@ -875,6 +932,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Removes one session from the list (you're done with it) and redraws the open menu.
+    /// Shows a banner for each session that newly needs you or just finished, and removes banners
+    /// for sessions that no longer wait on you.
+    func sessionsChanged(old: [SessionState], new: [SessionState]) {
+        let before = Dictionary(old.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let mode = model.config.banner
+        for s in new {
+            let prev = before[s.id]
+            let isNews = prev == nil || prev!.status != s.status || s.updatedAt.timeIntervalSince(prev!.updatedAt) > 0.5
+            guard isNews else { continue }
+            let wanted = mode == .all || (mode == .input && s.status == .needsInput)
+            if wanted { banners.show(s) } else { banners.remove(id: s.id, animated: true) }
+        }
+        let alive = Set(new.map(\.id))
+        for id in banners.visibleIDs where !alive.contains(id) && id != "test-banner" { banners.remove(id: id, animated: true) }
+    }
+
+    /// A sample banner for Settings → Banners → Show Test Banner.
+    func showTestBanner() {
+        banners.show(SessionState(id: "test-banner", status: .needsInput, title: "Test banner from Claude Chimes",
+                                  cwd: "", message: "This is what a banner looks like", appBundleID: nil, updatedAt: Date()))
+    }
+
     func dismiss(_ s: SessionState, in menu: NSMenu?) {
         Sessions.remove(s.id)
         EventLog.append("dismiss session=\(s.id.prefix(8)) status=\(s.status.rawValue)")
@@ -1128,6 +1207,41 @@ if let i = args.firstIndex(of: "--snapshot-rows"), i + 1 < args.count {
         window.appearance!.performAsCurrentDrawingAppearance {
             if let rep = panel.bitmapImageRepForCachingDisplay(in: panel.bounds) {
                 panel.cacheDisplay(in: panel.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: args[i + 1]))
+            }
+        }
+    }
+    exit(0)
+}
+
+// `ClaudeChimes --snapshot-banner out.png [--dark] [--finished]` renders a banner on a sample desktop color.
+if let i = args.firstIndex(of: "--snapshot-banner"), i + 1 < args.count {
+    MainActor.assumeIsolated {
+        _ = NSApplication.shared
+        let dark = args.contains("--dark"), finished = args.contains("--finished")
+        let s = SessionState(id: "demo", status: finished ? .finished : .needsInput,
+                             title: finished ? "Write the release notes" : "Fix the login redirect", cwd: "",
+                             message: finished ? nil : "Claude needs your permission to use Bash", appBundleID: nil, updatedAt: Date())
+        let pad: CGFloat = 20
+        let canvas = NSView(frame: NSRect(x: 0, y: 0, width: BannerView.size.width + 2 * pad, height: BannerView.size.height + 2 * pad))
+        canvas.wantsLayer = true
+        canvas.layer?.backgroundColor = (dark ? NSColor(calibratedRed: 0.13, green: 0.15, blue: 0.2, alpha: 1)
+                                              : NSColor(calibratedRed: 0.78, green: 0.83, blue: 0.9, alpha: 1)).cgColor
+        let banner = BannerView(session: s, onOpen: {}, onDismiss: {})
+        banner.frame.origin = NSPoint(x: pad, y: pad)
+        // Offscreen rendering can't sample the desktop for the blur, so stand in with the material's tint.
+        banner.wantsLayer = true
+        banner.layer?.cornerRadius = 14
+        banner.layer?.backgroundColor = (dark ? NSColor(white: 0.2, alpha: 0.92) : NSColor(white: 0.97, alpha: 0.92)).cgColor
+        canvas.addSubview(banner)
+        let window = NSWindow(contentRect: canvas.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+        window.contentView = canvas
+        canvas.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        window.appearance!.performAsCurrentDrawingAppearance {
+            if let rep = canvas.bitmapImageRepForCachingDisplay(in: canvas.bounds) {
+                canvas.cacheDisplay(in: canvas.bounds, to: rep)
                 try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: args[i + 1]))
             }
         }
