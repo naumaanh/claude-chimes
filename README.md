@@ -73,7 +73,7 @@ If you open the app without running the installer, for example a copy built with
 
 ## Using it
 
-The menu bar menu has two lists. Needs Your Input shows sessions with a permission prompt or question waiting, what they're asking, and how long ago. Ready for Your Reply shows sessions that finished a reply in the last day, and Clear Finished empties it. Click a row to open the session; a desktop chat opens through the app's `claude://code/continue?session=…` link. Click the × at the end of a row to dismiss just that session once you're done with it. Below the lists are a volume slider (it plays a preview when you let go), Mute (⌘M), Settings… (⌘,) and Quit.
+The menu bar menu has three lists. Needs Your Input shows sessions with a permission prompt or question waiting, what they're asking, and how long ago. Ready for Your Reply shows sessions that finished a reply in the last day, and Clear Finished empties it. Working shows what Claude is busy on right now, and for how long. Click a row to open the session. A desktop chat opens through the app's `claude://code/continue?session=…` link. A CLI session in Terminal or iTerm brings its exact tab to the front, and the first time macOS asks you to allow Claude Chimes to control that terminal. Other terminals come forward as a whole. Click the × at the end of a row to dismiss just that session once you're done with it. Below the lists are a volume slider (it plays a preview when you let go), Mute (⌘M), Settings… (⌘,) and Quit.
 
 A session leaves the list when you reply, approve the tool it asked about, or close it. If Claude quits without closing the session cleanly, after a crash or a closed terminal, the app sees that the process is gone and drops the session as well.
 
@@ -86,7 +86,7 @@ The Settings window has seven sections:
 - Sounds: the Needs input, Finished and Turn failed sounds, each with a play button.
 - When to Chime: how long a turn must run before Finished chimes (every reply, or after 15 seconds up to 5 minutes), the reminder for an unanswered prompt (off, or after 2 to 15 minutes), an optional cue before Claude compacts the conversation, and quiet hours.
 - Volume: the slider and Mute.
-- Menu Bar: what the badge counts (Needs input and finished, Needs input only, or Off) and whether finished sessions are listed.
+- Menu Bar: what the badge counts (Needs input and finished, Needs input only, or Off), and whether finished and working sessions are listed.
 - Banners: which sessions pop up a banner (needs input and finished, needs input only, or off), where it appears (top right, top center or bottom right), and how long it stays (4, 8 or 15 seconds, or until you dismiss it), plus a Show Test Banner button. Clicking a banner opens the session, and its × dismisses it. A banner waits while your pointer is over it, and closes by itself once you reply.
 - General: Launch at Login, a button that opens the sounds folder, and Uninstall.
 - Health: whether the hooks are installed, the hook link points at this app, your sounds exist, and hook events are arriving. Repair fixes the setup, Copy Diagnostics copies a report for bug reports, and Show Log opens the event log. When a check fails, the menu shows a Setup needs attention item.
@@ -109,6 +109,7 @@ quietStart=22:00
 quietEnd=08:00
 badge=all
 showFinished=1
+showWorking=1
 banner=all
 bannerPosition=topRight
 bannerSeconds=8
@@ -130,7 +131,7 @@ Claude Code runs [hooks](https://docs.claude.com/en/docs/claude-code/hooks) on l
 
 `chime-hook` is the menu bar app's own binary running in hook mode. It plays sounds with `afplay` in the background, so Claude is never kept waiting, and a call takes about 15 ms.
 
-Each waiting session is a small JSON file in `~/.claude/chimes/sessions`. It holds the session ID, the title from the session's local transcript, its folder, the prompt message, its Claude process ID, and for desktop chats the desktop app's chat ID. A file is deleted after a day, or as soon as its process exits. Finished desktop sessions are the exception: the desktop app can restart their process when you reply, so they stay for the full day. Entries without a process ID also stay for the day. Hook events are logged to `~/.claude/chimes/events.log`, which is capped at 256 KB.
+Each waiting session is a small JSON file in `~/.claude/chimes/sessions`. It holds the session ID, the title from the session's local transcript, its folder, the prompt message, its Claude process ID and terminal, the turn's start time and length, and for desktop chats the desktop app's chat ID. A file is deleted after a day, or as soon as its process exits. Finished desktop sessions are the exception: the desktop app can restart their process when you reply, so they stay for the full day. Entries without a process ID also stay for the day. Hook events are logged to `~/.claude/chimes/events.log`, which is capped at 256 KB.
 
 ## Troubleshooting
 

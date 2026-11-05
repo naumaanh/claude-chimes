@@ -45,7 +45,7 @@ The app uses macOS dynamic system colors, so it follows light mode, dark mode an
 ## 5. Layout principles
 
 - Native containers only: NSMenu, NSStatusItem, a SwiftUI Form in an NSWindow. Don't build custom menu bar popovers.
-- Menu order: setup warning (only when unhealthy), Needs Your Input, Ready for Your Reply, volume, Mute, Settings…, Quit.
+- Menu order: setup warning (only when unhealthy), Needs Your Input, Ready for Your Reply, Working (longest-running first, with a gray `ellipsis.bubble` icon and "Working for 3 min"), volume, Mute, Settings…, Quit. Working is last because it's the only list with nothing to act on.
 - Settings order: Sounds, Volume, Menu Bar, General, Health, About. The most-changed settings go at the top.
 - For a project page: content no wider than 1100 px, a single column under 768 px, no horizontal scrolling, and touch targets of at least 44 px.
 
