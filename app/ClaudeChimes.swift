@@ -119,6 +119,16 @@ struct SessionState: Codable, Identifiable {
     var pid: Int32?            // the session's Claude Code process (CLAUDE_PID)
     var pidStart: Double?      // that process's start time, so a reused PID isn't mistaken for it
     var entrypoint: String?    // CLAUDE_CODE_ENTRYPOINT: "claude-desktop", "cli", ...
+    var hostSessionID: String? // CLAUDE_CODE_HOST_SESSION_ID: the desktop app's chat ID ("local_…")
+
+    /// The Claude desktop app's link to this exact chat, when it runs in the desktop app.
+    var desktopLink: URL? {
+        // A CLI started from a terminal inside the desktop app inherits the host ID, so require the desktop entrypoint.
+        guard entrypoint == "claude-desktop", let id = hostSessionID,
+              id.range(of: #"^local_[A-Za-z0-9-]{1,64}$"#, options: .regularExpression) != nil
+        else { return nil }
+        return URL(string: "claude://code/continue?session=\(id)")
+    }
 
     /// Whether the session can still be waiting on you, judged by its Claude process.
     /// A pending prompt dies with its process. A finished desktop session can be resumed after
@@ -291,7 +301,8 @@ func runHook(_ event: String) -> Never {
         Sessions.write(SessionState(id: id, status: status, title: title, cwd: cwd, message: message,
                                     appBundleID: env["__CFBundleIdentifier"], updatedAt: Date(),
                                     pid: pid, pidStart: pid.flatMap(ProcessCheck.startTime),
-                                    entrypoint: env["CLAUDE_CODE_ENTRYPOINT"]))
+                                    entrypoint: env["CLAUDE_CODE_ENTRYPOINT"],
+                                    hostSessionID: env["CLAUDE_CODE_HOST_SESSION_ID"] ?? previous?.hostSessionID))
         EventLog.append("\(event) session=\(short) status=\(status.rawValue) title=\"\(title)\"\(config.muted ? " muted" : "")")
     }
 
@@ -879,7 +890,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func sessionItem(_ s: SessionState, symbol: String, detail: String) -> NSMenuItem {
         let i = item(s.title, #selector(openSession(_:)))
-        i.representedObject = s.appBundleID
+        i.representedObject = s
         i.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         i.toolTip = s.cwd
         if #available(macOS 14.4, *) { i.subtitle = detail } else { i.title = "\(s.title) (\(detail))" }
@@ -928,9 +939,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         model.reloadSessions()
     }
 
-    /// Brings the app the session runs in to the front (Claude desktop, or the terminal for CLI sessions).
+    /// Opens the session: desktop chats open directly via the Claude app's `claude://code/continue` link;
+    /// CLI sessions (and older entries without a desktop ID) bring their app to the front.
     @objc func openSession(_ sender: NSMenuItem) {
-        let bundleID = (sender.representedObject as? String) ?? "com.anthropic.claudefordesktop"
+        guard let s = sender.representedObject as? SessionState else { return }
+        if let link = s.desktopLink, NSWorkspace.shared.open(link) {
+            EventLog.append("open session=\(s.id.prefix(8)) via=desktop-link")
+            return
+        }
+        let bundleID = s.appBundleID ?? "com.anthropic.claudefordesktop"
         if let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first {
             running.activate()
         } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
@@ -984,7 +1001,7 @@ if args.contains("--repair") {
 }
 if args.contains("--list-sessions") {
     for s in Sessions.all() {
-        print("\(s.status.rawValue)\t\(s.id.prefix(8))\tpid=\(s.pid.map(String.init) ?? "-")\t\(s.entrypoint ?? "-")\t\(s.title)")
+        print("\(s.status.rawValue)\t\(s.id.prefix(8))\tpid=\(s.pid.map(String.init) ?? "-")\t\(s.entrypoint ?? "-")\t\(s.title)\t\(s.desktopLink?.absoluteString ?? "-")")
     }
     exit(0)
 }

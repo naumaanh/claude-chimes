@@ -21,7 +21,7 @@ It doesn't apply to regular chats in the desktop app or on claude.ai, which don'
   | **Query**: three glassy bell notes, unresolved | **Settle**: three descending kalimba notes |
   | **Knock**: two muted wooden taps | **Bloom**: a slow, warm chord that rings out |
 
-- **See what's waiting on you.** The menu bar lists Claude sessions that need your input (with what they're asking) and sessions that finished and are ready for your reply. Click a session to jump to the app it's running in.
+- **See what's waiting on you.** The menu bar lists Claude sessions that need your input (with what they're asking) and sessions that finished and are ready for your reply. Click a session to open it. Desktop-app chats open directly, and CLI sessions bring your terminal to the front.
 - **Badge on the icon**: a number beside the menu bar icon counts the sessions waiting on you. It's red when one needs your input and gray when they're only ready for your reply. You can count both, only those needing input, or turn it off.
 - **Quick controls in the menu**: volume and mute.
 - **Settings window** for picking each sound (bundled chimes, your own files, or macOS sounds), previewing them, menu bar options, and Launch at Login.
@@ -57,7 +57,7 @@ Running it again is safe. It replaces its own hooks and keeps your settings. Res
 
 - **Needs Your Input**: sessions with a permission prompt or a question waiting, plus what they're asking and how long ago.
 - **Ready for Your Reply**: sessions that finished a reply in the last day. **Clear Finished** empties this list.
-- Click a session to bring its app to the front (the Claude desktop app, or your terminal for CLI sessions).
+- Click a session to open it. Chats in the Claude desktop app open directly, through the app's `claude://code/continue?session=…` link. CLI sessions bring your terminal to the front.
 - **Volume** slider (previews on release) and **Mute** (⌘M).
 - **Settings…** (⌘,) and **Quit**.
 
@@ -98,7 +98,7 @@ Claude Code runs [hooks](https://docs.claude.com/en/docs/claude-code/hooks) on l
 
 `chime-hook` is the menu bar app's own binary running in hook mode. It plays sounds with `afplay` in the background, so Claude is never kept waiting. A hook call takes about 15 ms.
 
-Waiting sessions are stored as small JSON files in `~/.claude/chimes/sessions`. Each one holds the session ID, its title (read from the session's local transcript), its folder, the prompt message, and the session's Claude process ID. Entries are deleted after a day, or sooner once their process exits. Two exceptions apply: a finished desktop-app session is kept, since the app can restart its process when you reply, and so is an entry with no process ID. Hook events are logged to `~/.claude/chimes/events.log`, which is capped at 256 KB. Nothing is sent anywhere.
+Waiting sessions are stored as small JSON files in `~/.claude/chimes/sessions`. Each one holds the session ID, its title (read from the session's local transcript), its folder, the prompt message, the session's Claude process ID, and (for desktop chats) the desktop app's chat ID. Entries are deleted after a day, or sooner once their process exits. Two exceptions apply: a finished desktop-app session is kept, since the app can restart its process when you reply, and so is an entry with no process ID. Hook events are logged to `~/.claude/chimes/events.log`, which is capped at 256 KB. Nothing is sent anywhere.
 
 ## Troubleshooting
 
