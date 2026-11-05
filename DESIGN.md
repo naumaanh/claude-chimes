@@ -35,6 +35,9 @@ The app uses macOS dynamic system colors, so it follows light mode, dark mode an
 - Volume slider (in the menu and in Settings): previews the Finished sound once, when you let go, never while dragging.
 - Settings window: a SwiftUI grouped Form, 500 pt wide, with its position remembered between launches. Each sound row is the label with a caption, then a 150 pt picker, then a borderless play button. Choosing a sound plays it once. Reloading settings from disk never plays anything.
 - Health rows: a status icon, then the title with a one-line caption saying what's wrong and what to do. Repair is enabled only when a check fails or the link points at another copy. Status messages under the buttons clear after 4 to 8 seconds.
+- App icon: the same sine wave in off-white (#F5F5F7) on a charcoal rounded square (#1B1B1E), following the macOS icon grid: an 824-of-1024 tile, a 185 px corner radius, a soft drop shadow, and a faint top light. It's drawn in code (`AppIcon.swift`), so it stays in step with the menu bar icon.
+- Welcome window: 440 pt wide. It shows the icon and name, one paragraph on what the app does, and an exact list of what setup will change, then Not Now and Set Up (the default button). After setup it shows the two things to do next. It never sets anything up without a click.
+- Uninstall: a confirmation alert with a destructive Uninstall button, a checkbox to also delete sounds and settings (off by default), and the app moved to the Trash rather than deleted.
 - Empty, error and loading states: the menu's empty line and Health's warnings are the empty and error states. Nothing takes long enough to need a loader.
 
 ## 5. Layout principles

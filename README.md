@@ -36,14 +36,15 @@ cd claude-chimes
 ./install.sh
 ```
 
-The installer:
+The installer builds Claude Chimes.app into `~/Applications` as one binary for both Apple silicon and Intel, with the chimes and icon bundled inside. It then runs the app's own setup, which:
 
-1. Generates the chimes into `~/.claude/chimes/sounds`.
-2. Builds Claude Chimes.app into `~/Applications` and links its hook entry point to `~/.claude/chimes/chime-hook`.
-3. Adds the hooks listed under [How it works](#how-it-works) to `~/.claude/settings.json`, after saving a backup (`settings.json.bak-chimes-<timestamp>`). Your other settings and hooks stay as they are.
-4. Opens the app.
+1. Copies the chimes to `~/.claude/chimes/sounds`.
+2. Links the hook entry point, `~/.claude/chimes/chime-hook`, to the app.
+3. Adds the hooks listed under [How it works](#how-it-works) to `~/.claude/settings.json`, after saving a backup (`settings.json.bak-chimes-<timestamp>`). Only those hooks change. The rest of the file, including its key order and formatting, stays as it was.
 
-You can run it again safely. It replaces its own hooks and keeps your settings. Restart any open Claude Code sessions so they load the new hooks.
+You can run it again safely: it replaces only its own hooks and keeps your settings. Restart any open Claude Code sessions so they load the new hooks. Add `--native` to build only for your Mac's chip, which is about twice as fast.
+
+If you open the app without running the installer, for example a copy built with `app/build.sh`, it shows a welcome window that does the same setup when you click Set Up.
 
 ## Using it
 
@@ -56,7 +57,7 @@ The Settings window has five sections:
 - Sounds: the Needs input and Finished sounds, each with a play button.
 - Volume: the slider and Mute.
 - Menu Bar: what the badge counts (Needs input and finished, Needs input only, or Off) and whether finished sessions are listed.
-- General: Launch at Login, and a button that opens the sounds folder.
+- General: Launch at Login, a button that opens the sounds folder, and Uninstall.
 - Health: whether the hooks are installed, the hook link points at this app, your sounds exist, and hook events are arriving. Repair fixes the setup, Copy Diagnostics copies a report for bug reports, and Show Log opens the event log. When a check fails, the menu shows a Setup needs attention item.
 
 ### Without the menu bar app
@@ -94,11 +95,11 @@ Start with Settings → Health. From a terminal you can also run:
 
 ```bash
 ~/.claude/chimes/chime-hook --doctor         # health report and recent events (exit code 1 if something fails)
-~/.claude/chimes/chime-hook --repair         # relink the hook and re-add the hooks (backs up settings.json)
+~/.claude/chimes/chime-hook --repair         # copy missing chimes, relink the hook, re-add the hooks (backs up settings.json)
 ~/.claude/chimes/chime-hook --list-sessions  # what's waiting on you right now
 ```
 
-If a session that was already open stays silent, restart it so it loads the hooks. If you moved the app, it relinks itself the next time it launches. If another tool rewrote `settings.json`, use Repair. It adds back only the Claude Chimes hooks and keeps everything else, though it writes the file with its keys in alphabetical order.
+If a session that was already open stays silent, restart it so it loads the hooks. If you moved the app, it relinks itself the next time it launches. If another tool rewrote `settings.json`, use Repair, which adds back only the Claude Chimes hooks.
 
 To avoid hearing two sounds at once, turn off the desktop app's own notification sound: in the Claude desktop app, set Settings → Claude Code → Notification sound to None, or turn off "Play sound for notifications" under System Settings → Notifications → Claude. Banners still show. Leave your Mac's main volume alone, since the chimes play through it.
 
@@ -108,14 +109,18 @@ To change the sounds, edit the notes, instruments and timing in [`sounds/generat
 
 To change the menu bar icon, replace [`assets/menubar.svg`](assets/menubar.svg) and `menubar-muted.svg` (18×18, black on transparent), then run `app/build.sh`.
 
-The menu, the Settings window and hook mode are all in [`app/ClaudeChimes.swift`](app/ClaudeChimes.swift). Rebuild with `app/build.sh`. The hook link points into the app, so hooks pick up the new build automatically. [`DESIGN.md`](DESIGN.md) describes the visual and interaction rules the app follows.
+The app's code is in [`app/Sources`](app/Sources): `main.swift` has the menu, the Settings window and hook mode, `Installer.swift` handles setup and removal, `OrderedJSON.swift` edits `settings.json` without reordering it, `Welcome.swift` has the first-run window and Uninstall, and `AppIcon.swift` draws the icon (`--render-app-icon`). Rebuild with `app/build.sh`. The hook link points into the app, so hooks pick up the new build automatically. [`DESIGN.md`](DESIGN.md) describes the visual and interaction rules the app follows.
 
 ## Uninstall
+
+Open Settings → General → Uninstall…, or from the repo:
 
 ```bash
 ./uninstall.sh                # removes the hooks, the app, and ~/.claude/chimes
 ./uninstall.sh --keep-sounds  # same, but keeps ~/.claude/chimes
 ```
+
+Either way, only Claude Chimes' hooks leave `settings.json`, after a backup.
 
 ## License
 
