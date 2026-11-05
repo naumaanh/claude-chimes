@@ -2,7 +2,12 @@
 // session when you're done with it. Clicking anywhere else on the row opens the session.
 //
 // Menu items with a custom view lose the native highlight, so the row draws the standard
-// rounded selection itself and switches its text to the selected-menu colors on hover.
+// rounded selection itself and switches its text to the selected-menu colors.
+//
+// Only one row is ever highlighted. While a menu is open, AppKit can drop a row's mouse-exited
+// event when the pointer moves quickly, so rows don't decide on their own: `SessionRowView.highlight(_:)`
+// is the single source of truth, fed by the menu delegate's willHighlight (authoritative) and by
+// each row's mouse-entered (immediate). Closing the menu clears it.
 
 import AppKit
 
@@ -19,6 +24,17 @@ final class SessionRowView: NSView {
     }
 
     static let height: CGFloat = 40
+
+    /// The one highlighted row, if any.
+    private static weak var current: SessionRowView?
+
+    /// Highlights `row` and un-highlights every other row. Pass nil to clear.
+    static func highlight(_ row: SessionRowView?) {
+        guard current !== row else { return }
+        current?.hovering = false
+        current = row
+        row?.hovering = true
+    }
 
     init(title titleText: String, subtitle subtitleText: String, symbol: String, iconTint: NSColor = .secondaryLabelColor,
          onOpen: @escaping () -> Void, onDismiss: @escaping () -> Void) {
@@ -80,8 +96,13 @@ final class SessionRowView: NSView {
         addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
     }
 
-    override func mouseEntered(with event: NSEvent) { hovering = true }
-    override func mouseExited(with event: NSEvent) { hovering = false }
+    override func mouseEntered(with event: NSEvent) { Self.highlight(self) }
+    override func mouseExited(with event: NSEvent) { if Self.current === self { Self.highlight(nil) } }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil, Self.current === self { Self.highlight(nil) }   // menu closed or rebuilt
+    }
 
     override func mouseUp(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
@@ -97,7 +118,7 @@ final class SessionRowView: NSView {
     }
 
     @objc private func dismissTapped() {
-        hovering = false
+        Self.highlight(nil)
         onDismiss()
     }
 
@@ -115,6 +136,6 @@ final class SessionRowView: NSView {
         dismiss.contentTintColor = hovering ? selected : .tertiaryLabelColor
     }
 
-    /// For snapshots: draw the row as if the pointer were over it.
+    /// For snapshots: draw the row as if the pointer were over it, without touching the shared highlight.
     func setHovering(_ on: Bool) { hovering = on }
 }

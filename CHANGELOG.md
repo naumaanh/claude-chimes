@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.4.1] - 2026-11-05
+
+### Fixed
+- Two session rows could stay highlighted at once in the menu. The menu's own highlight now drives the rows, so exactly one is highlighted, and it clears when you move to another item or close the menu.
+
 ## [1.4.0] - 2026-11-05
 
 ### Added
