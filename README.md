@@ -21,7 +21,8 @@ It doesn't apply to regular chats in the desktop app or on claude.ai, which don'
   | **Query**: three glassy bell notes, unresolved | **Settle**: three descending kalimba notes |
   | **Knock**: two muted wooden taps | **Bloom**: a slow, warm chord that rings out |
 
-- **See what's waiting on you.** The menu bar lists Claude sessions that need your input (with what they're asking) and sessions that finished and are ready for your reply. A count next to the icon shows how many need you. Click a session to jump to the app it's running in.
+- **See what's waiting on you.** The menu bar lists Claude sessions that need your input (with what they're asking) and sessions that finished and are ready for your reply. Click a session to jump to the app it's running in.
+- **Badge on the icon**: a number beside the menu bar icon counts the sessions waiting on you. It's red when one needs your input and gray when they're only ready for your reply. You can count both, only those needing input, or turn it off.
 - **Quick controls in the menu**: volume and mute.
 - **Settings window** for picking each sound (bundled chimes, your own files, or macOS sounds), previewing them, menu bar options, and Launch at Login.
 - **Bring your own sounds**: drop any `.wav`, `.aiff`, `.mp3`, `.m4a` or `.caf` into `~/.claude/chimes/sounds` and it appears in Settings.
@@ -66,7 +67,7 @@ A session leaves the list when you reply to it, approve the tool it was asking a
 
 - **Sounds**: pick the *Needs input* and *Finished* sounds, with a play button for each.
 - **Volume**: slider and Mute.
-- **Menu Bar**: show the waiting count next to the icon, and list finished sessions.
+- **Menu Bar**: what the badge counts (*Needs input and finished*, *Needs input only*, or *Off*), and whether to list finished sessions.
 - **General**: Launch at Login, and a button that opens the sounds folder.
 
 ### Without the menu bar app
@@ -78,7 +79,7 @@ input=/Users/you/.claude/chimes/sounds/input-nudge.wav
 done=/Users/you/.claude/chimes/sounds/done-spark.wav
 volume=0.40
 muted=0
-showCount=1
+badge=all
 showFinished=1
 ```
 

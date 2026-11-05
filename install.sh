@@ -28,7 +28,7 @@ input=$CHIMES/sounds/input-nudge.wav
 done=$CHIMES/sounds/done-spark.wav
 volume=0.40
 muted=0
-showCount=1
+badge=all
 showFinished=1
 CONF
 fi

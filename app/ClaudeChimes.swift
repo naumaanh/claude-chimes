@@ -31,8 +31,20 @@ struct Config: Equatable {
     var done = soundsDir.appendingPathComponent("done-spark.wav").path
     var volume = 0.4
     var muted = false
-    var showCount = true      // show the number of sessions needing input next to the icon
+    var badge = Badge.all     // what the number badge on the menu bar icon counts
     var showFinished = true   // list sessions that finished and are waiting for your reply
+
+    enum Badge: String, CaseIterable, Identifiable {
+        case all, input, off
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .all: return "Needs input and finished"
+            case .input: return "Needs input only"
+            case .off: return "Off"
+            }
+        }
+    }
 
     static func load() -> Config {
         var c = Config()
@@ -47,7 +59,8 @@ struct Config: Equatable {
             case "done": c.done = (v as NSString).expandingTildeInPath
             case "volume": c.volume = min(1, max(0, Double(v) ?? c.volume))
             case "muted": c.muted = on
-            case "showCount": c.showCount = on
+            case "badge": c.badge = Badge(rawValue: v) ?? c.badge
+            case "showCount": if !on { c.badge = .off }   // 1.1 setting; replaced by badge
             case "showFinished": c.showFinished = on
             default: break
             }
@@ -62,7 +75,7 @@ struct Config: Equatable {
         done=\(done)
         volume=\(String(format: "%.2f", volume))
         muted=\(muted ? 1 : 0)
-        showCount=\(showCount ? 1 : 0)
+        badge=\(badge.rawValue)
         showFinished=\(showFinished ? 1 : 0)
 
         """
@@ -317,7 +330,11 @@ struct SettingsView: View {
             }
 
             Section("Menu Bar") {
-                Toggle("Show how many sessions need your input", isOn: $model.config.showCount)
+                Picker("Badge on icon", selection: $model.config.badge) {
+                    ForEach(Config.Badge.allCases) { Text($0.label).tag($0) }
+                }
+                Text("Red when a session needs your input, gray when sessions are only waiting for your reply.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Toggle("List sessions that finished and are waiting for your reply", isOn: $model.config.showFinished)
             }
 
@@ -360,6 +377,43 @@ enum StatusIcon {
         img?.size = NSSize(width: 18, height: 18)
         img?.isTemplate = true
         img?.accessibilityDescription = "Claude Chimes"
+        return img
+    }
+
+    /// The icon with a number badge in its top-right corner: red when something needs your input,
+    /// gray when sessions are only waiting for your reply. Count 0 returns the plain template icon.
+    /// Drawn on demand, so the icon follows the menu bar's light/dark appearance.
+    static func image(muted: Bool, count: Int, urgent: Bool) -> NSImage? {
+        guard count > 0, let base = image(muted: muted) else { return image(muted: muted) }
+        let text = count > 9 ? "9+" : "\(count)"
+        let font = NSFont.systemFont(ofSize: 9, weight: .bold)
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white]
+        let textSize = (text as NSString).size(withAttributes: attrs)
+        let badgeH: CGFloat = 12
+        let badgeW = max(badgeH, ceil(textSize.width) + 6)
+        let size = NSSize(width: 20 + badgeW, height: 18)
+
+        let img = NSImage(size: size, flipped: false) { _ in
+            // Icon, tinted with the menu bar's text color.
+            let iconRect = NSRect(x: 0, y: 0, width: 18, height: 18)
+            let icon = NSImage(size: iconRect.size, flipped: false) { r in
+                base.draw(in: r)
+                NSColor.labelColor.set()
+                r.fill(using: .sourceAtop)
+                return true
+            }
+            icon.draw(in: iconRect)
+
+            // Badge: a small pill beside the icon, vertically centered.
+            let badge = NSRect(x: size.width - badgeW, y: (size.height - badgeH) / 2, width: badgeW, height: badgeH)
+            (urgent ? NSColor.systemRed : NSColor.systemGray).setFill()
+            NSBezierPath(roundedRect: badge, xRadius: badgeH / 2, yRadius: badgeH / 2).fill()
+            (text as NSString).draw(at: NSPoint(x: badge.midX - textSize.width / 2, y: badge.midY - textSize.height / 2),
+                                    withAttributes: attrs)
+            return true
+        }
+        img.isTemplate = false
+        img.accessibilityDescription = "Claude Chimes, \(count) waiting"
         return img
     }
 }
@@ -409,10 +463,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func updateStatusButton() {
         guard let button = statusItem?.button else { return }
         let c = model.config
-        button.image = StatusIcon.image(muted: c.muted || c.volume == 0)
-        let waiting = model.needsInput.count
-        button.title = (c.showCount && waiting > 0) ? "\(waiting)" : ""
-        button.toolTip = waiting > 0 ? "Claude Chimes: \(waiting) waiting on you" : "Claude Chimes"
+        let needs = model.needsInput.count, finished = model.finished.count
+        let count: Int
+        switch c.badge {
+        case .all: count = needs + finished
+        case .input: count = needs
+        case .off: count = 0
+        }
+        button.image = StatusIcon.image(muted: c.muted || c.volume == 0, count: count, urgent: needs > 0)
+        button.title = ""
+        var parts: [String] = []
+        if needs > 0 { parts.append("\(needs) need\(needs == 1 ? "s" : "") your input") }
+        if finished > 0 { parts.append("\(finished) ready for your reply") }
+        button.toolTip = parts.isEmpty ? "Claude Chimes" : "Claude Chimes: " + parts.joined(separator: ", ")
     }
 
     // Rebuilt each time the menu opens.
@@ -552,6 +615,38 @@ if let i = args.firstIndex(of: "--hook") {
 // Used by uninstall.sh to remove the login item before the app is deleted.
 if args.contains("--disable-login-item") {
     try? SMAppService.mainApp.unregister()
+    exit(0)
+}
+
+// `ClaudeChimes --snapshot-icons out.png` renders the menu bar icon's badge states on light and dark bars.
+if let i = args.firstIndex(of: "--snapshot-icons"), i + 1 < args.count {
+    MainActor.assumeIsolated {
+        _ = NSApplication.shared
+        let states: [(Bool, Int, Bool)] = [(false, 0, false), (false, 2, false), (false, 1, true), (false, 3, true), (false, 12, true), (true, 2, true)]
+        let cellW: CGFloat = 44, rowH: CGFloat = 28, scale: CGFloat = 4
+        let W = cellW * CGFloat(states.count), H = rowH * 2
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(W * scale), pixelsHigh: Int(H * scale),
+                                   bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                   colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        rep.size = NSSize(width: W, height: H)
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        for (row, name) in [NSAppearance.Name.aqua, .darkAqua].enumerated() {
+            let appearance = NSAppearance(named: name)!
+            appearance.performAsCurrentDrawingAppearance {
+                let y = H - rowH * CGFloat(row + 1)
+                (row == 0 ? NSColor(white: 0.95, alpha: 1) : NSColor(white: 0.12, alpha: 1)).setFill()
+                NSRect(x: 0, y: y, width: W, height: rowH).fill()
+                for (col, s) in states.enumerated() {
+                    guard let img = StatusIcon.image(muted: s.0, count: s.1, urgent: s.2) else { continue }
+                    let drawn = img.isTemplate ? NSImage(size: img.size, flipped: false) { r in
+                        img.draw(in: r); NSColor.labelColor.set(); r.fill(using: .sourceAtop); return true } : img
+                    drawn.draw(in: NSRect(x: CGFloat(col) * cellW + (cellW - img.size.width) / 2,
+                                          y: y + (rowH - img.size.height) / 2, width: img.size.width, height: img.size.height))
+                }
+            }
+        }
+        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: args[i + 1]))
+    }
     exit(0)
 }
 
