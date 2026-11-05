@@ -6,6 +6,10 @@ Claude Chimes plays a soft chime when Claude needs your input (a permission prom
 
 > Unofficial community project. Not made by, endorsed by, or affiliated with Anthropic.
 
+<p>
+  <img src="docs/menu-bar-badges.png" alt="The menu bar icon with no badge, a gray badge, red badges, and muted" width="520">
+</p>
+
 ## Features
 
 The six chimes are synthesized on your Mac by a small Python script, so nothing is downloaded:
@@ -24,11 +28,28 @@ The chimes play straight from the hooks, so they work even when the menu bar app
 
 ## Requirements
 
-- macOS 14 (Sonoma) or later
-- Xcode Command Line Tools, for `swiftc` and `python3` (`xcode-select --install`)
+- macOS 14 (Sonoma) or later, on Apple silicon or Intel
 - Claude Code, in the Claude desktop app's Code tab or the CLI
+- To build from source: Xcode Command Line Tools, for `swiftc` and `python3` (`xcode-select --install`)
 
 ## Install
+
+### Download
+
+1. Download `ClaudeChimes-<version>.zip` from the [latest release](https://github.com/naumaanh/claude-chimes/releases/latest), unzip it, and move Claude Chimes.app to Applications.
+2. Open it. The app isn't notarized by Apple, so macOS will say it can't verify the developer. Open System Settings → Privacy & Security, scroll down, and click Open Anyway. You only do this once. Alternatively, run:
+
+   ```bash
+   xattr -dr com.apple.quarantine "/Applications/Claude Chimes.app"
+   ```
+
+3. Click Set Up in the welcome window.
+
+<p>
+  <img src="docs/welcome.png" alt="The welcome window, listing what setup will change" width="440">
+</p>
+
+### From source
 
 ```bash
 git clone https://github.com/naumaanh/claude-chimes.git
@@ -51,6 +72,10 @@ If you open the app without running the installer, for example a copy built with
 The menu bar menu has two lists. Needs Your Input shows sessions with a permission prompt or question waiting, what they're asking, and how long ago. Ready for Your Reply shows sessions that finished a reply in the last day, and Clear Finished empties it. Clicking a desktop chat opens it through the app's `claude://code/continue?session=…` link. Below the lists are a volume slider (it plays a preview when you let go), Mute (⌘M), Settings… (⌘,) and Quit.
 
 A session leaves the list when you reply, approve the tool it asked about, or close it. If Claude quits without closing the session cleanly, after a crash or a closed terminal, the app sees that the process is gone and drops the session as well.
+
+<p>
+  <img src="docs/settings.png" alt="The Settings window" width="420">
+</p>
 
 The Settings window has five sections:
 
@@ -102,6 +127,12 @@ Start with Settings → Health. From a terminal you can also run:
 If a session that was already open stays silent, restart it so it loads the hooks. If you moved the app, it relinks itself the next time it launches. If another tool rewrote `settings.json`, use Repair, which adds back only the Claude Chimes hooks.
 
 To avoid hearing two sounds at once, turn off the desktop app's own notification sound: in the Claude desktop app, set Settings → Claude Code → Notification sound to None, or turn off "Play sound for notifications" under System Settings → Notifications → Claude. Banners still show. Leave your Mac's main volume alone, since the chimes play through it.
+
+## Development
+
+`tests/run.sh` builds the app into a throwaway home folder and checks setup, every hook event, session pruning, the health check, log rotation and uninstall. It never touches your real `~/.claude` or the copy of the app you're running. CI runs it on every pull request.
+
+To publish a release, bump `CFBundleShortVersionString` in `app/Info.plist`, add a section to [`CHANGELOG.md`](CHANGELOG.md), and push a matching tag such as `v1.4.0`. The release workflow tests, builds the universal app, and attaches the zip.
 
 ## Customizing
 

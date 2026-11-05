@@ -3,6 +3,7 @@
 # The app is self-contained: the chimes and icon are bundled, and it sets up its own hooks.
 # Usage: app/build.sh [--no-open] [--native]
 #   --native   build only for this Mac's CPU (faster); the default is a universal Apple silicon + Intel binary
+# Set CLAUDE_CHIMES_NO_KILL=1 to leave a running copy of the app alone (used by the tests).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="${CLAUDE_CHIMES_APP:-$HOME/Applications/Claude Chimes.app}"
@@ -22,7 +23,7 @@ for arch in $ARCHS; do
 done
 python3 "$ROOT/sounds/generate.py" "$WORK/sounds" >/dev/null
 
-pkill -x ClaudeChimes 2>/dev/null || true
+[ "${CLAUDE_CHIMES_NO_KILL:-}" = 1 ] || pkill -x ClaudeChimes 2>/dev/null || true
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 lipo -create "$WORK"/ClaudeChimes-* -output "$APP/Contents/MacOS/ClaudeChimes"
