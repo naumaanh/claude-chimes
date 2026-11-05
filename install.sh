@@ -1,11 +1,14 @@
 #!/bin/bash
-# Claude Chimes installer: sounds, hook script, Claude Code hooks, and the menu bar app.
-# Safe to run again; it replaces its own hooks and keeps your sound choices.
+# Claude Chimes installer: sounds, the menu bar app, and the Claude Code hooks.
+# Safe to run again; it replaces its own hooks and keeps your settings.
+# Usage: ./install.sh [--no-open]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 CHIMES="$HOME/.claude/chimes"
 SETTINGS="$HOME/.claude/settings.json"
+APP="${CLAUDE_CHIMES_APP:-$HOME/Applications/Claude Chimes.app}"
+export CLAUDE_CHIMES_APP="$APP"
 
 say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[31mError:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -18,20 +21,26 @@ command -v python3 >/dev/null || die "python3 not found. Install the Xcode Comma
 say "Generating chimes in ~/.claude/chimes/sounds"
 python3 "$ROOT/sounds/generate.py" "$CHIMES/sounds" >/dev/null
 
-say "Installing hook script to ~/.claude/chimes/chime.sh"
-install -m 755 "$ROOT/hooks/chime.sh" "$CHIMES/chime.sh"
-
 if [ ! -f "$CHIMES/config" ]; then
   cat > "$CHIMES/config" <<CONF
-# Claude Chimes config: read by ~/.claude/chimes/chime.sh, written by the menu bar app
+# Claude Chimes config: written by the menu bar app, read by the chime hook
 input=$CHIMES/sounds/input-nudge.wav
 done=$CHIMES/sounds/done-spark.wav
 volume=0.40
 muted=0
+showCount=1
+showFinished=1
 CONF
 fi
 
-say "Adding Notification and Stop hooks to ~/.claude/settings.json"
+say "Building the menu bar app"
+"$ROOT/app/build.sh" --no-open
+
+say "Linking the hook to ~/.claude/chimes/chime-hook"
+ln -sf "$APP/Contents/MacOS/ClaudeChimes" "$CHIMES/chime-hook"
+rm -f "$CHIMES/chime.sh"   # replaced by chime-hook in 1.1
+
+say "Adding hooks to ~/.claude/settings.json"
 python3 - "$SETTINGS" <<'PY'
 import json, os, shutil, sys, time
 
@@ -46,15 +55,33 @@ if os.path.exists(path):
         sys.exit(f"{path} is not valid JSON ({e}); fix it and run install.sh again.")
     shutil.copy2(path, f"{path}.bak-chimes-{time.strftime('%Y%m%d%H%M%S')}")
 
+OURS = "/.claude/chimes/chime"
+# (event, hook argument, runs in the background?)
+WANTED = [
+    ("Notification", "notification", False),  # chime + mark "needs your input"
+    ("Stop", "stop", False),                  # chime + mark "ready for your reply"
+    ("UserPromptSubmit", "prompt", True),     # you replied: clear the session
+    ("PostToolUse", "tool", True),            # a tool ran: permission was answered
+    ("SessionEnd", "end", True),              # session closed: clear it
+]
+
 hooks = settings.setdefault("hooks", {})
-for event, arg in (("Notification", "input"), ("Stop", "done")):
+for event in list(hooks):  # drop any earlier Claude Chimes hooks, keep everything else
     groups = []
-    for g in hooks.get(event, []):  # drop any earlier Claude Chimes hook, keep everything else
-        kept = [h for h in g.get("hooks", []) if "chimes/chime.sh" not in h.get("command", "")]
+    for g in hooks[event]:
+        kept = [h for h in g.get("hooks", []) if OURS not in h.get("command", "")]
         if kept:
             groups.append({**g, "hooks": kept})
-    groups.append({"hooks": [{"type": "command", "command": f"~/.claude/chimes/chime.sh {arg}", "timeout": 5}]})
-    hooks[event] = groups
+    if groups:
+        hooks[event] = groups
+    else:
+        del hooks[event]
+
+for event, arg, background in WANTED:
+    hook = {"type": "command", "command": f"~/.claude/chimes/chime-hook {arg}", "timeout": 5}
+    if background:
+        hook["async"] = True
+    hooks.setdefault(event, []).append({"hooks": [hook]})
 
 os.makedirs(os.path.dirname(path), exist_ok=True)
 with open(path + ".tmp", "w") as f:
@@ -63,13 +90,13 @@ with open(path + ".tmp", "w") as f:
 os.replace(path + ".tmp", path)
 PY
 
-say "Building the menu bar app"
-"$ROOT/app/build.sh" "$@"
+[ "${1:-}" = "--no-open" ] || open "$APP"
 
 cat <<DONE
 
 Claude Chimes is installed. Look for its icon in the menu bar.
-  - Sounds play when Claude needs your input and when it finishes a reply.
+  - Chimes play when Claude needs your input and when it finishes a reply.
+  - The menu lists sessions waiting on you; Settings… holds the sound setup.
   - Works in the Claude desktop app's Code tab and the claude CLI.
   - Already-open sessions may need a restart to pick up the new hooks.
 DONE

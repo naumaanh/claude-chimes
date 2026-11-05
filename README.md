@@ -21,9 +21,11 @@ It doesn't apply to regular chats in the desktop app or on claude.ai, which don'
   | **Query**: three glassy bell notes, unresolved | **Settle**: three descending kalimba notes |
   | **Knock**: two muted wooden taps | **Bloom**: a slow, warm chord that rings out |
 
-- **Menu bar app** for choosing each sound (including the built-in macOS sounds), a volume slider, mute, test buttons, and Launch at Login.
-- **Bring your own sounds**: drop any `.wav`, `.aiff`, `.mp3`, `.m4a` or `.caf` into `~/.claude/chimes/sounds` and it appears in the menu.
-- **Light touch**: two Claude Code hooks and one small shell script, with no background process needed to play sounds. The menu bar app is just for changing settings.
+- **See what's waiting on you.** The menu bar lists Claude sessions that need your input (with what they're asking) and sessions that finished and are ready for your reply. A count next to the icon shows how many need you. Click a session to jump to the app it's running in.
+- **Quick controls in the menu**: volume and mute.
+- **Settings window** for picking each sound (bundled chimes, your own files, or macOS sounds), previewing them, menu bar options, and Launch at Login.
+- **Bring your own sounds**: drop any `.wav`, `.aiff`, `.mp3`, `.m4a` or `.caf` into `~/.claude/chimes/sounds` and it appears in Settings.
+- **Light touch**: chimes play straight from the hooks, so they work even when the menu bar app isn't running. Everything stays on your Mac.
 
 ## Requirements
 
@@ -42,48 +44,59 @@ cd claude-chimes
 The installer:
 
 1. Generates the chimes into `~/.claude/chimes/sounds`.
-2. Copies the hook script to `~/.claude/chimes/chime.sh`.
-3. Adds a `Notification` hook and a `Stop` hook to `~/.claude/settings.json`. It keeps your other settings and hooks, and saves a backup first (`settings.json.bak-chimes-<timestamp>`).
-4. Builds **Claude Chimes.app** into `~/Applications` and opens it.
+2. Builds **Claude Chimes.app** into `~/Applications`, and links its hook entry point to `~/.claude/chimes/chime-hook`.
+3. Adds hooks to `~/.claude/settings.json` (listed under [How it works](#how-it-works)). It keeps your other settings and hooks, and saves a backup first (`settings.json.bak-chimes-<timestamp>`).
+4. Opens the app.
 
-Running it again is safe. It replaces its own hooks and keeps your sound choices. Restart any open Claude Code sessions so they pick up the new hooks.
+Running it again is safe. It replaces its own hooks and keeps your settings. Restart any open Claude Code sessions so they pick up the new hooks.
 
 ## Using it
 
-Click the icon in the menu bar:
+**The menu bar menu**
 
-- **Needs Input / Finished**: pick a sound. Choosing one plays a preview.
-- **Volume**: drag the slider. It previews on release. The default is 40%.
-- **Mute** (⌘M): silences both sounds and keeps your choices.
-- **Play Needs Input / Play Finished**: hear the current sounds.
-- **Open Sounds Folder**: add your own audio files.
-- **Launch at Login**: keep the menu bar app around after a restart. The sounds work without it.
+- **Needs Your Input**: sessions with a permission prompt or a question waiting, plus what they're asking and how long ago.
+- **Ready for Your Reply**: sessions that finished a reply in the last day. **Clear Finished** empties this list.
+- Click a session to bring its app to the front (the Claude desktop app, or your terminal for CLI sessions).
+- **Volume** slider (previews on release) and **Mute** (⌘M).
+- **Settings…** (⌘,) and **Quit**.
+
+A session leaves the list when you reply to it, approve the tool it was asking about, or close it.
+
+**The Settings window**
+
+- **Sounds**: pick the *Needs input* and *Finished* sounds, with a play button for each.
+- **Volume**: slider and Mute.
+- **Menu Bar**: show the waiting count next to the icon, and list finished sessions.
+- **General**: Launch at Login, and a button that opens the sounds folder.
 
 ### Without the menu bar app
 
-Everything lives in `~/.claude/chimes/config`, a plain text file you can edit by hand:
+The chimes don't need the app running. Everything lives in `~/.claude/chimes/config`, a plain text file you can edit by hand:
 
 ```ini
 input=/Users/you/.claude/chimes/sounds/input-nudge.wav
 done=/Users/you/.claude/chimes/sounds/done-spark.wav
 volume=0.40
 muted=0
+showCount=1
+showFinished=1
 ```
 
 ## How it works
 
-Claude Code runs [hooks](https://docs.claude.com/en/docs/claude-code/hooks) on lifecycle events. The installer adds these to `~/.claude/settings.json`:
+Claude Code runs [hooks](https://docs.claude.com/en/docs/claude-code/hooks) on lifecycle events. The installer adds these to `~/.claude/settings.json`, each calling `~/.claude/chimes/chime-hook <event>`:
 
-```json
-{
-  "hooks": {
-    "Notification": [{ "hooks": [{ "type": "command", "command": "~/.claude/chimes/chime.sh input", "timeout": 5 }] }],
-    "Stop":         [{ "hooks": [{ "type": "command", "command": "~/.claude/chimes/chime.sh done",  "timeout": 5 }] }]
-  }
-}
-```
+| Hook | Argument | What it does |
+| --- | --- | --- |
+| `Notification` | `notification` | Plays the *Needs input* chime and marks the session as needing you. Idle reminders are skipped. |
+| `Stop` | `stop` | Plays the *Finished* chime and marks the session as ready for your reply. |
+| `UserPromptSubmit` | `prompt` | You replied, so the session is cleared (runs in the background). |
+| `PostToolUse` | `tool` | A tool ran, so a pending permission prompt was answered (runs in the background). |
+| `SessionEnd` | `end` | The session closed, so it's cleared (runs in the background). |
 
-`chime.sh` reads the config and plays the chosen file with `afplay` in the background, so Claude is never kept waiting.
+`chime-hook` is the menu bar app's own binary running in hook mode. It plays sounds with `afplay` in the background, so Claude is never kept waiting. A hook call takes about 15 ms.
+
+Waiting sessions are stored as small JSON files in `~/.claude/chimes/sessions`. Each one holds the session ID, its title (read from the session's local transcript), its folder, and the prompt message. Entries older than a day are deleted. Nothing is sent anywhere.
 
 **Tip:** to avoid hearing two sounds, turn off the desktop app's own notification sound. In the Claude desktop app, open Settings → Claude Code and set Notification sound to None, or open System Settings → Notifications → Claude and turn off "Play sound for notifications". Banners still show. Leave your Mac's main volume alone, since the chimes play through it.
 
@@ -91,7 +104,7 @@ Claude Code runs [hooks](https://docs.claude.com/en/docs/claude-code/hooks) on l
 
 - **Sounds:** edit the notes, instruments, and timing in [`sounds/generate.py`](sounds/generate.py), then run `python3 sounds/generate.py ~/.claude/chimes/sounds`.
 - **Menu bar icon:** replace [`assets/menubar.svg`](assets/menubar.svg) and `menubar-muted.svg` (18×18, black on transparent), then run `app/build.sh`.
-- **App code:** everything is in [`app/ClaudeChimes.swift`](app/ClaudeChimes.swift). Rebuild with `app/build.sh`.
+- **App code:** the menu, the Settings window and hook mode are all in [`app/ClaudeChimes.swift`](app/ClaudeChimes.swift). Rebuild with `app/build.sh`. The hook link points into the app, so it picks up the new build automatically.
 
 ## Uninstall
 
