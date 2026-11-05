@@ -81,6 +81,13 @@ sed -i '' -e '/^quietHours=/d' -e '/^quietStart=/d' -e '/^quietEnd=/d' -e '/^fin
 echo '{"session_id":"f1","cwd":"/tmp/f1","error":"API overloaded"}' | lim "$HOOK" failure
 check "a failed turn is recorded with its error" 'python3 -c "import json,sys; s=json.load(open(sys.argv[1])); assert s[\"failed\"] and s[\"message\"]==\"API overloaded\"" "$SESSIONS/f1.json"'
 check "a failed turn plays the error chime" 'lastlog | grep -q "failure session=f1.*chime=played"'
+TTYPID=$(ps -ax -o pid=,tty= | awk '$2 ~ /^ttys/ {print $1; exit}')
+if [ -n "$TTYPID" ]; then
+  hook t1 prompt CLAUDE_PID=$TTYPID CLAUDE_CODE_ENTRYPOINT=cli TERM_PROGRAM=Apple_Terminal
+  check "a CLI session records its terminal (TTY)" 'lim "$HOOK" --list-sessions </dev/null | grep "^working	t1" | grep -q "	/dev/ttys[0-9]*$"'
+else
+  ok "a CLI session records its terminal (skipped: no process with a TTY here)"
+fi
 echo '{"session_id":"k1"}' | lim "$HOOK" compact
 check "the compaction cue is off by default" 'lastlog | grep -q "compact session=k1 chime=off"'
 hook s2 stop; hook s2 end

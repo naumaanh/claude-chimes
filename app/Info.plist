@@ -12,6 +12,7 @@
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSUIElement</key><true/>
+  <key>NSAppleEventsUsageDescription</key><string>Claude Chimes switches to the Terminal or iTerm tab that a Claude session is running in when you click it.</string>
   <key>NSHumanReadableCopyright</key><string>MIT License. Unofficial; not affiliated with Anthropic.</string>
 </dict>
 </plist>

@@ -42,6 +42,7 @@ struct Config: Equatable {
     var muted = false
     var badge = Badge.all     // what the number badge on the menu bar icon counts
     var showFinished = true   // list sessions that finished and are waiting for your reply
+    var showWorking = true    // list sessions Claude is working on right now
     var banner = Badge.all    // which sessions pop up an on-screen banner (same three choices as the badge)
     var bannerPosition = BannerPosition.topRight
     var bannerSeconds = 8     // 0 keeps a banner until you dismiss it
@@ -114,6 +115,7 @@ struct Config: Equatable {
             case "badge": c.badge = Badge(rawValue: v) ?? c.badge
             case "showCount": if !on { c.badge = .off }   // 1.1 setting; replaced by badge
             case "showFinished": c.showFinished = on
+            case "showWorking": c.showWorking = on
             case "banner": c.banner = Badge(rawValue: v) ?? c.banner
             case "bannerPosition": c.bannerPosition = BannerPosition(rawValue: v) ?? c.bannerPosition
             case "bannerSeconds": c.bannerSeconds = max(0, min(120, Int(v) ?? c.bannerSeconds))
@@ -133,6 +135,7 @@ struct Config: Equatable {
         muted=\(muted ? 1 : 0)
         badge=\(badge.rawValue)
         showFinished=\(showFinished ? 1 : 0)
+        showWorking=\(showWorking ? 1 : 0)
         banner=\(banner.rawValue)
         bannerPosition=\(bannerPosition.rawValue)
         bannerSeconds=\(bannerSeconds)
@@ -182,6 +185,8 @@ struct SessionState: Codable, Identifiable {
     var turnSeconds: Double?   // how long the finished turn took
     var failed: Bool?          // the turn ended with an error (StopFailure)
     var transcriptPath: String?
+    var tty: String?           // the Claude process's terminal, e.g. "/dev/ttys003" (CLI sessions only)
+    var termProgram: String?   // TERM_PROGRAM: "Apple_Terminal", "iTerm.app", "vscode", ...
 
     var isFailed: Bool { failed == true }
 
@@ -223,6 +228,18 @@ enum ProcessCheck {
         guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0, info.kp_proc.p_pid == pid else { return nil }
         let tv = info.kp_proc.p_starttime
         return Double(tv.tv_sec) + Double(tv.tv_usec) / 1_000_000
+    }
+
+    /// The controlling terminal of a process, such as "/dev/ttys003", or nil if it has none.
+    static func tty(_ pid: Int32) -> String? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0, info.kp_proc.p_pid == pid else { return nil }
+        let dev = info.kp_eproc.e_tdev
+        guard dev != -1, let name = devname(dev, S_IFCHR) else { return nil }
+        let s = String(cString: name)
+        return s.hasPrefix("tty") ? "/dev/" + s : nil
     }
 
     static func isAlive(pid: Int32, startedAt: Double?) -> Bool {
@@ -381,7 +398,9 @@ func runHook(_ event: String) -> Never {
                              entrypoint: env["CLAUDE_CODE_ENTRYPOINT"] ?? previous?.entrypoint,
                              hostSessionID: env["CLAUDE_CODE_HOST_SESSION_ID"] ?? previous?.hostSessionID,
                              workingSince: workingSince, turnSeconds: turnSeconds, failed: failed ? true : nil,
-                             transcriptPath: transcript ?? previous?.transcriptPath)
+                             transcriptPath: transcript ?? previous?.transcriptPath,
+                             tty: pid.flatMap(ProcessCheck.tty) ?? previous?.tty,
+                             termProgram: env["TERM_PROGRAM"] ?? previous?.termProgram)
         Sessions.write(s)
         EventLog.append("\(event) session=\(short) status=\(status.rawValue) title=\"\(title)\"\(note)")
         return s
@@ -766,6 +785,7 @@ struct SettingsView: View {
                 Text("Red when a session needs your input, gray when sessions are only waiting for your reply.")
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("List sessions ready for your reply", isOn: $model.config.showFinished)
+                Toggle("List sessions Claude is working on", isOn: $model.config.showWorking)
             }
 
             Section("Banners") {
@@ -1015,7 +1035,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(.separator())
         }
 
-        if needs.isEmpty && finished.isEmpty {
+        let anyWorking = model.config.showWorking && !model.working.isEmpty
+        if needs.isEmpty && finished.isEmpty && !anyWorking {
             let none = NSMenuItem(title: "Nothing waiting on you", action: nil, keyEquivalent: "")
             none.isEnabled = false
             menu.addItem(none)
@@ -1036,6 +1057,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     : sessionItem(s, symbol: "checkmark.bubble", detail: "Finished \(ago(s.updatedAt))"))
             }
             menu.addItem(item("Clear Finished", #selector(clearFinished)))
+        }
+
+        // Working: what Claude is busy on right now, longest-running first. Nothing to act on, so it goes last.
+        let working = model.config.showWorking
+            ? model.working.sorted { ($0.workingSince ?? $0.updatedAt) < ($1.workingSince ?? $1.updatedAt) } : []
+        if !working.isEmpty {
+            if !needs.isEmpty || !finished.isEmpty { menu.addItem(.separator()) }
+            menu.addItem(NSMenuItem.sectionHeader(title: "Working"))
+            for s in working.prefix(10) {
+                let since = s.workingSince ?? s.updatedAt
+                let elapsed = Date().timeIntervalSince(since)
+                menu.addItem(sessionItem(s, symbol: "ellipsis.bubble",
+                                         detail: elapsed < 45 ? "Working · started just now" : "Working for \(BannerView.duration(elapsed))"))
+            }
         }
 
         menu.addItem(.separator())
@@ -1165,7 +1200,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             EventLog.append("open session=\(s.id.prefix(8)) via=desktop-link")
             return
         }
-        let bundleID = s.appBundleID ?? "com.anthropic.claudefordesktop"
+        if TerminalJump.focus(s) {
+            EventLog.append("open session=\(s.id.prefix(8)) via=terminal-tab")
+            return
+        }
+        let bundleID = s.appBundleID ?? TerminalJump.bundleID(for: s.termProgram) ?? "com.anthropic.claudefordesktop"
         if let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first {
             running.activate()
         } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
@@ -1262,7 +1301,7 @@ if let i = args.firstIndex(of: "--dismiss") {
 }
 if args.contains("--list-sessions") {
     for s in Sessions.all() {
-        print("\(s.status.rawValue)\t\(s.id.prefix(8))\tpid=\(s.pid.map(String.init) ?? "-")\t\(s.entrypoint ?? "-")\t\(s.title)\t\(s.desktopLink?.absoluteString ?? "-")")
+        print("\(s.status.rawValue)\t\(s.id.prefix(8))\tpid=\(s.pid.map(String.init) ?? "-")\t\(s.entrypoint ?? "-")\t\(s.title)\t\(s.desktopLink?.absoluteString ?? "-")\t\(s.tty ?? "-")")
     }
     exit(0)
 }

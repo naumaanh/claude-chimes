@@ -8,6 +8,8 @@
 - An error chime ("Dip") and a "Turn failed" banner and menu row when a turn ends with an error, through Claude Code's `StopFailure` hook.
 - An optional soft cue before Claude compacts the conversation (`PreCompact` hook), off by default.
 - Quiet hours: a daily window, which can wrap past midnight, that mutes chimes, banners and reminders while sessions are still tracked.
+- A Working section in the menu: the sessions Claude is busy on right now, with how long each has been running. You can turn it off in Settings → Menu Bar.
+- Clicking a CLI session brings its exact Terminal or iTerm tab to the front, matched by the terminal its Claude process runs on. macOS asks once for permission to control the terminal. Other terminals still come forward as a whole.
 
 ### Changed
 - Sending a message now marks a session as working instead of clearing it, and a tool run after a permission prompt returns it to working. That's what makes turn length measurable, and it sets up a Working section.
