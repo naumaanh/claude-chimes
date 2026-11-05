@@ -795,6 +795,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.toolTip = parts.isEmpty ? "Claude Chimes" : "Claude Chimes: " + parts.joined(separator: ", ")
     }
 
+    // The menu's own highlight drives the session rows, so exactly one row (or none) is highlighted.
+    func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
+        SessionRowView.highlight(item?.view as? SessionRowView)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        SessionRowView.highlight(nil)
+    }
+
     // Rebuilt each time the menu opens.
     func menuNeedsUpdate(_ menu: NSMenu) {
         model.reloadConfig()
