@@ -74,7 +74,9 @@ shift_time s1 workingSince 120
 hook s1 stop
 check "a long turn plays the Finished chime" 'lastlog | grep -Eq "turn=1[12][0-9]s chime=played"'
 check "turn length is recorded" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"turnSeconds\"] >= 119" "$SESSIONS/s1.json"'
-printf 'quietHours=1\nquietStart=00:00\nquietEnd=23:59\nfinishedMinSeconds=0\n' >> "$HOME/.claude/chimes/config"
+# A window from an hour ago to an hour from now, so the check holds at any time of day (and wraps past midnight).
+QUIET=$(python3 -c 'import datetime as d; n=d.datetime.now(); f=lambda t: t.strftime("%H:%M"); print(f(n-d.timedelta(hours=1)), f(n+d.timedelta(hours=1)))')
+printf 'quietHours=1\nquietStart=%s\nquietEnd=%s\nfinishedMinSeconds=0\n' $QUIET >> "$HOME/.claude/chimes/config"
 hook s1 stop
 check "quiet hours mute the chime" 'lastlog | grep -q "chime=quiet-hours"'
 sed -i '' -e '/^quietHours=/d' -e '/^quietStart=/d' -e '/^quietEnd=/d' -e '/^finishedMinSeconds=/d' "$HOME/.claude/chimes/config"
