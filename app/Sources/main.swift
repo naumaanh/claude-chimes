@@ -37,13 +37,36 @@ let appVersion = appBundle.object(forInfoDictionaryKey: "CFBundleShortVersionStr
 struct Config: Equatable {
     var input = soundsDir.appendingPathComponent("input-nudge.wav").path
     var done = soundsDir.appendingPathComponent("done-spark.wav").path
+    var error = soundsDir.appendingPathComponent("error-dip.wav").path
     var volume = 0.4
     var muted = false
     var badge = Badge.all     // what the number badge on the menu bar icon counts
     var showFinished = true   // list sessions that finished and are waiting for your reply
+    var showWorking = true    // list sessions Claude is working on right now
     var banner = Badge.all    // which sessions pop up an on-screen banner (same three choices as the badge)
     var bannerPosition = BannerPosition.topRight
     var bannerSeconds = 8     // 0 keeps a banner until you dismiss it
+    var finishedMinSeconds = 30   // only chime/banner Finished for turns at least this long (0 = always)
+    var reminderMinutes = 5       // remind once about a prompt left unanswered this long (0 = off)
+    var compactChime = false      // a soft cue when Claude is about to compact the conversation
+    var quietHours = false        // mute chimes and banners between quietStart and quietEnd
+    var quietStart = "22:00"
+    var quietEnd = "08:00"
+
+    /// Minutes after midnight for an "HH:MM" string.
+    static func minutes(_ hhmm: String) -> Int? {
+        let p = hhmm.split(separator: ":").compactMap { Int($0) }
+        guard p.count == 2, (0..<24).contains(p[0]), (0..<60).contains(p[1]) else { return nil }
+        return p[0] * 60 + p[1]
+    }
+
+    /// Whether `date` falls in quiet hours. Windows can wrap past midnight (22:00 to 08:00).
+    func inQuietHours(_ date: Date = Date()) -> Bool {
+        guard quietHours, let start = Config.minutes(quietStart), let end = Config.minutes(quietEnd), start != end else { return false }
+        let c = Calendar.current.dateComponents([.hour, .minute], from: date)
+        let now = (c.hour ?? 0) * 60 + (c.minute ?? 0)
+        return start < end ? (now >= start && now < end) : (now >= start || now < end)
+    }
 
     enum BannerPosition: String, CaseIterable, Identifiable {
         case topRight, topCenter, bottomRight
@@ -80,11 +103,19 @@ struct Config: Equatable {
             switch parts[0].trimmingCharacters(in: .whitespaces) {
             case "input": c.input = (v as NSString).expandingTildeInPath
             case "done": c.done = (v as NSString).expandingTildeInPath
+            case "error": c.error = (v as NSString).expandingTildeInPath
+            case "finishedMinSeconds": c.finishedMinSeconds = max(0, min(3600, Int(v) ?? c.finishedMinSeconds))
+            case "reminderMinutes": c.reminderMinutes = max(0, min(240, Int(v) ?? c.reminderMinutes))
+            case "quietHours": c.quietHours = on
+            case "compactChime": c.compactChime = on
+            case "quietStart": if Config.minutes(v) != nil { c.quietStart = v }
+            case "quietEnd": if Config.minutes(v) != nil { c.quietEnd = v }
             case "volume": c.volume = min(1, max(0, Double(v) ?? c.volume))
             case "muted": c.muted = on
             case "badge": c.badge = Badge(rawValue: v) ?? c.badge
             case "showCount": if !on { c.badge = .off }   // 1.1 setting; replaced by badge
             case "showFinished": c.showFinished = on
+            case "showWorking": c.showWorking = on
             case "banner": c.banner = Badge(rawValue: v) ?? c.banner
             case "bannerPosition": c.bannerPosition = BannerPosition(rawValue: v) ?? c.bannerPosition
             case "bannerSeconds": c.bannerSeconds = max(0, min(120, Int(v) ?? c.bannerSeconds))
@@ -99,13 +130,21 @@ struct Config: Equatable {
         # Claude Chimes config: written by the menu bar app, read by the chime hook
         input=\(input)
         done=\(done)
+        error=\(error)
         volume=\(String(format: "%.2f", volume))
         muted=\(muted ? 1 : 0)
         badge=\(badge.rawValue)
         showFinished=\(showFinished ? 1 : 0)
+        showWorking=\(showWorking ? 1 : 0)
         banner=\(banner.rawValue)
         bannerPosition=\(bannerPosition.rawValue)
         bannerSeconds=\(bannerSeconds)
+        finishedMinSeconds=\(finishedMinSeconds)
+        reminderMinutes=\(reminderMinutes)
+        compactChime=\(compactChime ? 1 : 0)
+        quietHours=\(quietHours ? 1 : 0)
+        quietStart=\(quietStart)
+        quietEnd=\(quietEnd)
 
         """
         try? FileManager.default.createDirectory(at: chimesDir, withIntermediateDirectories: true)
@@ -121,14 +160,14 @@ func soundFiles(in dir: URL) -> [URL] {
 
 func displayName(_ path: String) -> String {
     var name = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
-    for prefix in ["input-", "done-"] where name.hasPrefix(prefix) { name.removeFirst(prefix.count) }
+    for prefix in ["input-", "done-", "error-"] where name.hasPrefix(prefix) { name.removeFirst(prefix.count) }
     return name.replacingOccurrences(of: "-", with: " ").capitalized
 }
 
 // MARK: - Sessions waiting on you
 
 struct SessionState: Codable, Identifiable {
-    enum Status: String, Codable { case needsInput = "needs-input", finished }
+    enum Status: String, Codable { case needsInput = "needs-input", finished, working }
     var id: String
     var status: Status
     var title: String
@@ -141,6 +180,15 @@ struct SessionState: Codable, Identifiable {
     var pidStart: Double?      // that process's start time, so a reused PID isn't mistaken for it
     var entrypoint: String?    // CLAUDE_CODE_ENTRYPOINT: "claude-desktop", "cli", ...
     var hostSessionID: String? // CLAUDE_CODE_HOST_SESSION_ID: the desktop app's chat ID ("local_…")
+    // Added in 1.6:
+    var workingSince: Date?    // when you last sent a message; the turn's start
+    var turnSeconds: Double?   // how long the finished turn took
+    var failed: Bool?          // the turn ended with an error (StopFailure)
+    var transcriptPath: String?
+    var tty: String?           // the Claude process's terminal, e.g. "/dev/ttys003" (CLI sessions only)
+    var termProgram: String?   // TERM_PROGRAM: "Apple_Terminal", "iTerm.app", "vscode", ...
+
+    var isFailed: Bool { failed == true }
 
     /// The Claude desktop app's link to this exact chat, when it runs in the desktop app.
     var desktopLink: URL? {
@@ -156,7 +204,18 @@ struct SessionState: Codable, Identifiable {
     /// the app restarts its process, so only finished CLI sessions are dropped when the process exits.
     var isStale: Bool {
         guard let pid, !ProcessCheck.isAlive(pid: pid, startedAt: pidStart) else { return false }
-        return status == .needsInput || entrypoint != "claude-desktop"
+        return status != .finished || entrypoint != "claude-desktop"
+    }
+
+    /// A "working" session whose turn ended without a Stop event (for example, you interrupted it):
+    /// nothing has touched it or its transcript for half an hour.
+    var isAbandonedWork: Bool {
+        guard status == .working else { return false }
+        let idle: TimeInterval = 30 * 60
+        let lastTranscriptWrite = transcriptPath.flatMap {
+            (try? FileManager.default.attributesOfItem(atPath: $0))?[.modificationDate] as? Date
+        } ?? updatedAt
+        return Date().timeIntervalSince(max(updatedAt, lastTranscriptWrite)) > idle
     }
 }
 
@@ -169,6 +228,18 @@ enum ProcessCheck {
         guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0, info.kp_proc.p_pid == pid else { return nil }
         let tv = info.kp_proc.p_starttime
         return Double(tv.tv_sec) + Double(tv.tv_usec) / 1_000_000
+    }
+
+    /// The controlling terminal of a process, such as "/dev/ttys003", or nil if it has none.
+    static func tty(_ pid: Int32) -> String? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0, info.kp_proc.p_pid == pid else { return nil }
+        let dev = info.kp_eproc.e_tdev
+        guard dev != -1, let name = devname(dev, S_IFCHR) else { return nil }
+        let s = String(cString: name)
+        return s.hasPrefix("tty") ? "/dev/" + s : nil
     }
 
     static func isAlive(pid: Int32, startedAt: Double?) -> Bool {
@@ -214,9 +285,9 @@ enum Sessions {
                 try? FileManager.default.removeItem(at: f)
                 continue
             }
-            if s.isStale {
+            if s.isStale || s.isAbandonedWork {
                 try? FileManager.default.removeItem(at: f)
-                EventLog.append("pruned session=\(s.id.prefix(8)) reason=process-exited status=\(s.status.rawValue)")
+                EventLog.append("pruned session=\(s.id.prefix(8)) reason=\(s.isStale ? "process-exited" : "idle-working") status=\(s.status.rawValue)")
                 continue
             }
             out.append(s)
@@ -310,24 +381,43 @@ func runHook(_ event: String) -> Never {
     let id = payload["session_id"] as? String ?? ""
     let cwd = payload["cwd"] as? String ?? ""
     let volume = Double(env["CLAUDE_CHIMES_VOLUME"] ?? "") ?? config.volume
-
     let short = id.isEmpty ? "-" : String(id.prefix(8))
+    let transcript = payload["transcript_path"] as? String
 
-    func record(_ status: SessionState.Status, message: String?) {
-        guard !id.isEmpty else { return }
+    @discardableResult
+    func record(_ status: SessionState.Status, message: String?, workingSince: Date? = nil,
+                turnSeconds: Double? = nil, failed: Bool = false, note: String = "") -> SessionState? {
+        guard !id.isEmpty else { return nil }
         let previous = Sessions.read(id)
         let folder = URL(fileURLWithPath: cwd).lastPathComponent
-        let title = transcriptTitle(payload["transcript_path"] as? String) ?? previous?.title ?? (folder.isEmpty ? "Claude session" : folder)
+        let title = transcriptTitle(transcript) ?? previous?.title ?? (folder.isEmpty ? "Claude session" : folder)
         let pid = env["CLAUDE_PID"].flatMap { Int32($0) }
-        Sessions.write(SessionState(id: id, status: status, title: title, cwd: cwd, message: message,
-                                    appBundleID: env["__CFBundleIdentifier"], updatedAt: Date(),
-                                    pid: pid, pidStart: pid.flatMap(ProcessCheck.startTime),
-                                    entrypoint: env["CLAUDE_CODE_ENTRYPOINT"],
-                                    hostSessionID: env["CLAUDE_CODE_HOST_SESSION_ID"] ?? previous?.hostSessionID))
-        EventLog.append("\(event) session=\(short) status=\(status.rawValue) title=\"\(title)\"\(config.muted ? " muted" : "")")
+        let s = SessionState(id: id, status: status, title: title, cwd: cwd, message: message,
+                             appBundleID: env["__CFBundleIdentifier"] ?? previous?.appBundleID, updatedAt: Date(),
+                             pid: pid ?? previous?.pid, pidStart: pid.flatMap(ProcessCheck.startTime) ?? previous?.pidStart,
+                             entrypoint: env["CLAUDE_CODE_ENTRYPOINT"] ?? previous?.entrypoint,
+                             hostSessionID: env["CLAUDE_CODE_HOST_SESSION_ID"] ?? previous?.hostSessionID,
+                             workingSince: workingSince, turnSeconds: turnSeconds, failed: failed ? true : nil,
+                             transcriptPath: transcript ?? previous?.transcriptPath,
+                             tty: pid.flatMap(ProcessCheck.tty) ?? previous?.tty,
+                             termProgram: env["TERM_PROGRAM"] ?? previous?.termProgram)
+        Sessions.write(s)
+        EventLog.append("\(event) session=\(short) status=\(status.rawValue) title=\"\(title)\"\(note)")
+        return s
+    }
+
+    /// Plays `path` unless muted or in quiet hours, and says which in the log line.
+    func chime(_ path: String) -> String {
+        if config.muted { return " chime=muted" }
+        if config.inQuietHours() { return " chime=quiet-hours" }
+        playDetached(path, volume: volume)
+        return " chime=played"
     }
 
     switch event {
+    case "prompt":
+        // You sent a message: the session is working, and the turn's clock starts.
+        record(.working, message: nil, workingSince: Date())
     case "notification":
         // Idle reminders arrive a minute after a reply finished; the Stop chime already covered that.
         let type = payload["notification_type"] as? String ?? ""
@@ -335,21 +425,32 @@ func runHook(_ event: String) -> Never {
             EventLog.append("notification session=\(short) type=\(type) skipped")
             exit(0)
         }
-        record(.needsInput, message: payload["message"] as? String)
-        if !config.muted { playDetached(config.input, volume: volume) }
-    case "stop":
-        record(.finished, message: nil)
-        if !config.muted { playDetached(config.done, volume: volume) }
+        record(.needsInput, message: payload["message"] as? String,
+               workingSince: Sessions.read(id)?.workingSince, note: chime(config.input))
     case "tool":
-        // A tool ran, so any permission prompt for this session has been answered.
-        // (Runs after every tool call, so it only logs when it changes something.)
-        if Sessions.read(id)?.status == .needsInput {
-            Sessions.remove(id)
-            EventLog.append("tool session=\(short) cleared needs-input")
+        // A tool ran, so a pending permission prompt was answered and Claude is working again.
+        // (Runs after every tool call, so it only writes when something changes.)
+        if let prev = Sessions.read(id), prev.status == .needsInput {
+            record(.working, message: nil, workingSince: prev.workingSince, note: " cleared needs-input")
         }
-    case "prompt", "end":
+    case "stop":
+        let started = Sessions.read(id)?.workingSince
+        let turn = started.map { Date().timeIntervalSince($0) }
+        let long = config.finishedMinSeconds == 0 || turn == nil || turn! >= Double(config.finishedMinSeconds)
+        let note = (turn.map { " turn=\(Int($0))s" } ?? "") + (long ? chime(config.done) : " chime=skipped-short-turn")
+        record(.finished, message: nil, turnSeconds: turn, note: note)
+    case "failure":
+        // The turn ended with an error (Claude Code's StopFailure hook).
+        let started = Sessions.read(id)?.workingSince
+        let reason = (payload["error"] as? String) ?? (payload["message"] as? String) ?? (payload["reason"] as? String)
+        record(.finished, message: reason ?? "Claude hit an error", turnSeconds: started.map { Date().timeIntervalSince($0) },
+               failed: true, note: chime(config.error))
+    case "compact":
+        // Optional cue: compaction summarizes earlier context, so it's worth a glance afterwards.
+        EventLog.append("compact session=\(short)\(config.compactChime ? chime(config.input) : " chime=off")")
+    case "end":
         if Sessions.read(id) != nil { Sessions.remove(id) }
-        EventLog.append("\(event) session=\(short) cleared")
+        EventLog.append("end session=\(short) cleared")
     default:
         EventLog.append("warn unknown-event \(event)")
     }
@@ -483,6 +584,7 @@ final class AppModel: ObservableObject {
 
     var needsInput: [SessionState] { sessions.filter { $0.status == .needsInput } }
     var finished: [SessionState] { sessions.filter { $0.status == .finished } }
+    var working: [SessionState] { sessions.filter { $0.status == .working } }
     var hasHealthFailure: Bool { health.contains { $0.level == .fail } }
 
     var needsRepair: Bool { health.contains { $0.level == .fail || ($0.level == .warn && $0.id == "link") } }
@@ -609,6 +711,19 @@ struct SettingsView: View {
     @ObservedObject var model: AppModel
     var height: CGFloat = 760
 
+    /// Binds a DatePicker to an "HH:MM" config string.
+    func timeBinding(_ key: WritableKeyPath<Config, String>) -> Binding<Date> {
+        Binding(
+            get: {
+                let m = Config.minutes(model.config[keyPath: key]) ?? 0
+                return Calendar.current.date(bySettingHour: m / 60, minute: m % 60, second: 0, of: Date()) ?? Date()
+            },
+            set: { d in
+                let c = Calendar.current.dateComponents([.hour, .minute], from: d)
+                model.config[keyPath: key] = String(format: "%02d:%02d", c.hour ?? 0, c.minute ?? 0)
+            })
+    }
+
     var body: some View {
         Form {
             Section("Sounds") {
@@ -616,6 +731,38 @@ struct SettingsView: View {
                          key: "input", path: $model.config.input, model: model)
                 SoundRow(title: "Finished", detail: "Claude finished a reply",
                          key: "done", path: $model.config.done, model: model)
+                SoundRow(title: "Turn failed", detail: "A turn ended with an error",
+                         key: "error", path: $model.config.error, model: model)
+            }
+
+            Section("When to Chime") {
+                Picker("Chime when Claude finishes", selection: $model.config.finishedMinSeconds) {
+                    Text("After every reply").tag(0)
+                    Text("After 15 seconds of work").tag(15)
+                    Text("After 30 seconds of work").tag(30)
+                    Text("After 1 minute of work").tag(60)
+                    Text("After 2 minutes of work").tag(120)
+                    Text("After 5 minutes of work").tag(300)
+                }
+                Text("Quick replies stay silent, so you only hear Finished when Claude has been working a while. Banners follow the same rule.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Picker("Remind me about an unanswered prompt", selection: $model.config.reminderMinutes) {
+                    Text("Off").tag(0)
+                    Text("After 2 minutes").tag(2)
+                    Text("After 5 minutes").tag(5)
+                    Text("After 10 minutes").tag(10)
+                    Text("After 15 minutes").tag(15)
+                }
+                Toggle("Chime before Claude compacts the conversation", isOn: $model.config.compactChime)
+                Toggle("Quiet hours", isOn: $model.config.quietHours)
+                if model.config.quietHours {
+                    HStack {
+                        DatePicker("From", selection: timeBinding(\.quietStart), displayedComponents: .hourAndMinute)
+                        DatePicker("to", selection: timeBinding(\.quietEnd), displayedComponents: .hourAndMinute)
+                    }
+                    Text("Chimes and banners stay quiet in this window. Sessions are still tracked in the menu.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
 
             Section("Volume") {
@@ -638,6 +785,7 @@ struct SettingsView: View {
                 Text("Red when a session needs your input, gray when sessions are only waiting for your reply.")
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("List sessions ready for your reply", isOn: $model.config.showFinished)
+                Toggle("List sessions Claude is working on", isOn: $model.config.showWorking)
             }
 
             Section("Banners") {
@@ -808,6 +956,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         model.reloadSessions()
         model.onSessionsChanged = { [weak self] old, new in self?.sessionsChanged(old: old, new: new) }
         Health.relinkIfNeeded()
+        Installer.upgradeIfNeeded()
         if Welcome.shouldShow { showWelcome() }
         watchSessions()
         model.reloadSessions()
@@ -818,6 +967,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.model.reloadConfig()
                 self?.model.reloadSessions()
                 self?.model.refreshHealth()
+                self?.remindAboutUnansweredPrompts()
             }
         }
     }
@@ -885,7 +1035,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(.separator())
         }
 
-        if needs.isEmpty && finished.isEmpty {
+        let anyWorking = model.config.showWorking && !model.working.isEmpty
+        if needs.isEmpty && finished.isEmpty && !anyWorking {
             let none = NSMenuItem(title: "Nothing waiting on you", action: nil, keyEquivalent: "")
             none.isEnabled = false
             menu.addItem(none)
@@ -900,9 +1051,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if !needs.isEmpty { menu.addItem(.separator()) }
             menu.addItem(NSMenuItem.sectionHeader(title: "Ready for Your Reply"))
             for s in finished.prefix(10) {
-                menu.addItem(sessionItem(s, symbol: "checkmark.bubble", detail: "Finished \(ago(s.updatedAt))"))
+                menu.addItem(s.isFailed
+                    ? sessionItem(s, symbol: "exclamationmark.triangle", tint: .systemOrange,
+                                  detail: "Failed \(ago(s.updatedAt))" + (s.message.map { " · \($0)" } ?? ""))
+                    : sessionItem(s, symbol: "checkmark.bubble", detail: "Finished \(ago(s.updatedAt))"))
             }
             menu.addItem(item("Clear Finished", #selector(clearFinished)))
+        }
+
+        // Working: what Claude is busy on right now, longest-running first. Nothing to act on, so it goes last.
+        let working = model.config.showWorking
+            ? model.working.sorted { ($0.workingSince ?? $0.updatedAt) < ($1.workingSince ?? $1.updatedAt) } : []
+        if !working.isEmpty {
+            if !needs.isEmpty || !finished.isEmpty { menu.addItem(.separator()) }
+            menu.addItem(NSMenuItem.sectionHeader(title: "Working"))
+            for s in working.prefix(10) {
+                let since = s.workingSince ?? s.updatedAt
+                let elapsed = Date().timeIntervalSince(since)
+                menu.addItem(sessionItem(s, symbol: "ellipsis.bubble",
+                                         detail: elapsed < 45 ? "Working · started just now" : "Working for \(BannerView.duration(elapsed))"))
+            }
         }
 
         menu.addItem(.separator())
@@ -936,16 +1104,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// for sessions that no longer wait on you.
     func sessionsChanged(old: [SessionState], new: [SessionState]) {
         let before = Dictionary(old.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        let mode = model.config.banner
+        let c = model.config
         for s in new {
             let prev = before[s.id]
             let isNews = prev == nil || prev!.status != s.status || s.updatedAt.timeIntervalSince(prev!.updatedAt) > 0.5
             guard isNews else { continue }
-            let wanted = mode == .all || (mode == .input && s.status == .needsInput)
+            if s.status == .working { banners.remove(id: s.id, animated: true); continue }
+            // Same rule as the Finished chime: short turns stay quiet unless they failed.
+            let shortTurn = s.status == .finished && !s.isFailed && c.finishedMinSeconds > 0
+                && (s.turnSeconds ?? .infinity) < Double(c.finishedMinSeconds)
+            let wanted = !c.inQuietHours() && !shortTurn
+                && (c.banner == .all || (c.banner == .input && (s.status == .needsInput || s.isFailed)))
             if wanted { banners.show(s) } else { banners.remove(id: s.id, animated: true) }
         }
         let alive = Set(new.map(\.id))
         for id in banners.visibleIDs where !alive.contains(id) && id != "test-banner" { banners.remove(id: id, animated: true) }
+    }
+
+    /// Keys ("id@updatedAt") of prompts already reminded about, so each gets one reminder.
+    var reminded: Set<String> = []
+
+    /// Chimes and shows a banner once for a prompt left unanswered for `reminderMinutes`.
+    func remindAboutUnansweredPrompts() {
+        let c = model.config
+        guard c.reminderMinutes > 0, !c.muted, !c.inQuietHours() else { return }
+        for s in model.needsInput where Date().timeIntervalSince(s.updatedAt) >= Double(c.reminderMinutes * 60) {
+            let key = "\(s.id)@\(s.updatedAt.timeIntervalSince1970)"
+            guard !reminded.contains(key) else { continue }
+            reminded.insert(key)
+            model.preview(c.input)
+            if c.banner != .off { banners.show(s) }
+            EventLog.append("remind session=\(s.id.prefix(8)) after=\(c.reminderMinutes)m")
+        }
     }
 
     /// A sample banner for Settings → Banners → Show Test Banner.
@@ -1010,7 +1200,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             EventLog.append("open session=\(s.id.prefix(8)) via=desktop-link")
             return
         }
-        let bundleID = s.appBundleID ?? "com.anthropic.claudefordesktop"
+        if TerminalJump.focus(s) {
+            EventLog.append("open session=\(s.id.prefix(8)) via=terminal-tab")
+            return
+        }
+        let bundleID = s.appBundleID ?? TerminalJump.bundleID(for: s.termProgram) ?? "com.anthropic.claudefordesktop"
         if let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first {
             running.activate()
         } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
@@ -1107,7 +1301,7 @@ if let i = args.firstIndex(of: "--dismiss") {
 }
 if args.contains("--list-sessions") {
     for s in Sessions.all() {
-        print("\(s.status.rawValue)\t\(s.id.prefix(8))\tpid=\(s.pid.map(String.init) ?? "-")\t\(s.entrypoint ?? "-")\t\(s.title)\t\(s.desktopLink?.absoluteString ?? "-")")
+        print("\(s.status.rawValue)\t\(s.id.prefix(8))\tpid=\(s.pid.map(String.init) ?? "-")\t\(s.entrypoint ?? "-")\t\(s.title)\t\(s.desktopLink?.absoluteString ?? "-")\t\(s.tty ?? "-")")
     }
     exit(0)
 }
@@ -1253,8 +1447,8 @@ if let i = args.firstIndex(of: "--snapshot-banner"), i + 1 < args.count {
 if let i = args.firstIndex(of: "--snapshot-settings"), i + 1 < args.count {
     MainActor.assumeIsolated {
         _ = NSApplication.shared
-        let view = NSHostingView(rootView: SettingsView(model: AppModel(), height: 1180))
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 1180),
+        let view = NSHostingView(rootView: SettingsView(model: AppModel(), height: 1500))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 1500),
                               styleMask: [.titled], backing: .buffered, defer: false)
         window.contentView = view
         window.appearance = NSAppearance(named: args.contains("--dark") ? .darkAqua : .aqua)

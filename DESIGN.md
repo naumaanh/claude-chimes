@@ -19,6 +19,7 @@ The app uses macOS dynamic system colors, so it follows light mode, dark mode an
 - Idle Gray (systemGray: #8E8E93 light, #98989D dark): the badge when sessions are only ready for your reply. Something is there, but nothing is urgent.
 - Badge Numeral (#FFFFFF): the count inside either badge.
 - Secondary Text (secondaryLabelColor: about #6E6E73 light, #98989D dark): captions, helper text and session subtitles.
+- Failed Orange (systemOrange): the icon and caption for a turn that ended with an error, in the menu and in banners. It's the one other alerting color, kept apart from red so "needs you" and "something broke" read differently.
 - Health Green, Orange and Red (systemGreen, systemOrange, systemRed): status icons in Settings → Health only. They never appear in the menu bar.
 - Accent: the user's macOS accent color, through standard controls (toggles, slider, links). The app sets no brand accent of its own.
 
@@ -44,7 +45,7 @@ The app uses macOS dynamic system colors, so it follows light mode, dark mode an
 ## 5. Layout principles
 
 - Native containers only: NSMenu, NSStatusItem, a SwiftUI Form in an NSWindow. Don't build custom menu bar popovers.
-- Menu order: setup warning (only when unhealthy), Needs Your Input, Ready for Your Reply, volume, Mute, Settings…, Quit.
+- Menu order: setup warning (only when unhealthy), Needs Your Input, Ready for Your Reply, Working (longest-running first, with a gray `ellipsis.bubble` icon and "Working for 3 min"), volume, Mute, Settings…, Quit. Working is last because it's the only list with nothing to act on.
 - Settings order: Sounds, Volume, Menu Bar, General, Health, About. The most-changed settings go at the top.
 - For a project page: content no wider than 1100 px, a single column under 768 px, no horizontal scrolling, and touch targets of at least 44 px.
 
@@ -60,7 +61,7 @@ The app uses macOS dynamic system colors, so it follows light mode, dark mode an
 
 - Emojis anywhere, in the UI, copy or icons.
 - An icon or badge that animates, pulses or bounces. A banner that bounces, loops, or takes focus from the app you're in.
-- A second alerting color, or red for anything except "a session needs your input".
+- Any alerting color beyond red (needs your input) and orange (a turn failed), or red used for anything else.
 - A badge that overlaps the wave.
 - Inter, or any serif font.
 - Neon glows, gradient text, glassmorphism, custom cursors.
