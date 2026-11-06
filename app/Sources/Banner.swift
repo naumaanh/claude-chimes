@@ -41,7 +41,9 @@ final class BannerView: NSView {
         let tint: NSColor = needs ? .systemRed : failed ? .systemOrange : .secondaryLabelColor
         icon.contentTintColor = tint
 
-        let caption = NSTextField(labelWithString: needs ? "Needs your input" : failed ? "Turn failed" : "Ready for your reply")
+        let what = needs ? "Needs your input" : failed ? "Turn failed" : "Ready for your reply"
+        let caption = NSTextField(labelWithString: s.remoteHost.map { "\(what) · on \($0)" } ?? what)
+        caption.lineBreakMode = .byTruncatingTail
         caption.font = .systemFont(ofSize: 11, weight: .medium)
         caption.textColor = tint
         caption.frame = NSRect(x: 46, y: 42, width: 250, height: 14)
