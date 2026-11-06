@@ -38,6 +38,9 @@ The app uses macOS dynamic system colors, so it follows light mode, dark mode an
 - Health rows: a status icon, then the title with a one-line caption saying what's wrong and what to do. Repair is enabled only when a check fails or the link points at another copy. Status messages under the buttons clear after 4 to 8 seconds.
 - App icon: the same sine wave in off-white (#F5F5F7) on a charcoal rounded square (#1B1B1E), following the macOS icon grid: an 824-of-1024 tile, a 185 px corner radius, a soft drop shadow, and a faint top light. It's drawn in code (`AppIcon.swift`), so it stays in step with the menu bar icon.
 - Banner: a 340×66 pt card with a frosted popover material, a 14 pt corner radius, a hairline separator border and a system shadow. It shows a caption ("Needs your input" in red, or "Ready for your reply" in gray), the session title in 13 pt semibold, and one detail line, with a faint × on the right. It floats at menu bar level on every Space without taking focus, 12 pt from the screen edge, and up to three stack 8 pt apart, newest nearest the edge.
+- Sessions from another Mac: the same rows, sections, icons and colors as this Mac's, with " · on <Mac name>" appended to the subtitle and the banner caption. They can't be opened from here, so a click clears the row on this Mac only. The tooltip says where the session runs.
+- Other Macs (Settings): one toggle with a caption saying what's shared, then paired Macs (a `laptopcomputer` symbol, the name, a status caption such as "Connected · 2 sessions", and Unpair), then unpaired Macs nearby (with Pair…). Lists show only when there's something in them; otherwise a caption says what's happening.
+- Pairing window: 380 pt wide, floating, shown on both Macs at once. It shows the other Mac's name, the six-digit code in 34 pt semibold monospaced digits ("123 456"), one sentence telling you to compare the codes, and Cancel and Pair (default). After you click Pair it says who it's waiting for. It ends with "Paired" and Done, or a plain-language error and Close. Pairing never completes without a click on both Macs.
 - Welcome window: 440 pt wide. It shows the icon and name, one paragraph on what the app does, and an exact list of what setup will change, then Not Now and Set Up (the default button). After setup it shows the two things to do next. It never sets anything up without a click.
 - Uninstall: a confirmation alert with a destructive Uninstall button, a checkbox to also delete sounds and settings (off by default), and the app moved to the Trash rather than deleted.
 - Empty, error and loading states: the menu's empty line and Health's warnings are the empty and error states. Nothing takes long enough to need a loader.
@@ -46,7 +49,7 @@ The app uses macOS dynamic system colors, so it follows light mode, dark mode an
 
 - Native containers only: NSMenu, NSStatusItem, a SwiftUI Form in an NSWindow. Don't build custom menu bar popovers.
 - Menu order: setup warning (only when unhealthy), Needs Your Input, Ready for Your Reply, Working (longest-running first, with a gray `ellipsis.bubble` icon and "Working for 3 min"), volume, Mute, Settings…, Quit. Working is last because it's the only list with nothing to act on.
-- Settings order: Sounds, Volume, Menu Bar, General, Health, About. The most-changed settings go at the top.
+- Settings order: Sounds, When to Chime, Volume, Menu Bar, Banners, Other Macs, General, Health, About. The most-changed settings go at the top.
 - For a project page: content no wider than 1100 px, a single column under 768 px, no horizontal scrolling, and touch targets of at least 44 px.
 
 ## 6. Motion and interaction

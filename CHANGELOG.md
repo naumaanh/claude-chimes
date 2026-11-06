@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.7.0] - 2026-11-06
+
+### Added
+- Other Macs. When you use Claude Code on more than one Mac, a session on one Mac shows in the menu, chimes and pops up a banner on your other Macs on the same network, with "on <Mac name>" under it. Chimes and banners follow the receiving Mac's own settings. Off by default: turn it on in Settings → Other Macs on both Macs, then pair them.
+- Pairing: click Pair… next to a nearby Mac, check that both Macs show the same six-digit code, and click Pair on both. Nothing is sent to a Mac you haven't paired. Messages are encrypted with a key only the pair has, and only the folder name of each session is shared, not its path. Unpair removes the pairing on both Macs.
+- macOS asks once to allow local network access, and to accept incoming connections if the firewall is on.
+
+### Changed
+- The Finished-threshold rule is now one function shared by the hook, banners and chimes for other Macs' sessions.
+- Copy Diagnostics reports whether Other Macs is on and how many Macs are paired (no names).
+
 ## [1.6.0] - 2026-11-05
 
 ### Added

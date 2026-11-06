@@ -52,6 +52,27 @@ struct Config: Equatable {
     var quietHours = false        // mute chimes and banners between quietStart and quietEnd
     var quietStart = "22:00"
     var quietEnd = "08:00"
+    var otherMacs = false         // share sessions with paired Macs on the same network (Peers.swift)
+
+    /// A finished turn shorter than the Finished threshold stays quiet. `nil` (unknown length) counts as long.
+    func isShortTurn(_ seconds: Double?) -> Bool {
+        finishedMinSeconds > 0 && (seconds ?? .infinity) < Double(finishedMinSeconds)
+    }
+
+    /// The sound for a session from another Mac that just changed state, or why it stays quiet.
+    /// Same rules as the hook uses for this Mac's sessions, with this Mac's settings.
+    func remoteChime(for s: SessionState, at date: Date = Date()) -> (path: String?, note: String) {
+        if muted { return (nil, "muted") }
+        if volume <= 0 { return (nil, "volume-0") }
+        if inQuietHours(date) { return (nil, "quiet-hours") }
+        switch s.status {
+        case .needsInput: return (input, "played")
+        case .working: return (nil, "none")
+        case .finished:
+            if s.isFailed { return (error, "played") }
+            return isShortTurn(s.turnSeconds) ? (nil, "skipped-short-turn") : (done, "played")
+        }
+    }
 
     /// Minutes after midnight for an "HH:MM" string.
     static func minutes(_ hhmm: String) -> Int? {
@@ -110,6 +131,7 @@ struct Config: Equatable {
             case "compactChime": c.compactChime = on
             case "quietStart": if Config.minutes(v) != nil { c.quietStart = v }
             case "quietEnd": if Config.minutes(v) != nil { c.quietEnd = v }
+            case "otherMacs": c.otherMacs = on
             case "volume": c.volume = min(1, max(0, Double(v) ?? c.volume))
             case "muted": c.muted = on
             case "badge": c.badge = Badge(rawValue: v) ?? c.badge
@@ -145,6 +167,7 @@ struct Config: Equatable {
         quietHours=\(quietHours ? 1 : 0)
         quietStart=\(quietStart)
         quietEnd=\(quietEnd)
+        otherMacs=\(otherMacs ? 1 : 0)
 
         """
         try? FileManager.default.createDirectory(at: chimesDir, withIntermediateDirectories: true)
@@ -187,8 +210,14 @@ struct SessionState: Codable, Identifiable {
     var transcriptPath: String?
     var tty: String?           // the Claude process's terminal, e.g. "/dev/ttys003" (CLI sessions only)
     var termProgram: String?   // TERM_PROGRAM: "Apple_Terminal", "iTerm.app", "vscode", ...
+    // Added in 1.7, only for sessions from another Mac (never written to disk by the hook):
+    var remotePeer: String?    // the paired Mac's peer ID
+    var remoteHost: String?    // its name, for "on Mac mini"
 
     var isFailed: Bool { failed == true }
+    var isRemote: Bool { remotePeer != nil }
+    /// Identifies one state of a session, so hiding it here lasts until it changes again.
+    var stateKey: String { "\(id)@\(updatedAt.timeIntervalSince1970)" }
 
     /// The Claude desktop app's link to this exact chat, when it runs in the desktop app.
     var desktopLink: URL? {
@@ -436,7 +465,7 @@ func runHook(_ event: String) -> Never {
     case "stop":
         let started = Sessions.read(id)?.workingSince
         let turn = started.map { Date().timeIntervalSince($0) }
-        let long = config.finishedMinSeconds == 0 || turn == nil || turn! >= Double(config.finishedMinSeconds)
+        let long = !config.isShortTurn(turn)
         let note = (turn.map { " turn=\(Int($0))s" } ?? "") + (long ? chime(config.done) : " chime=skipped-short-turn")
         record(.finished, message: nil, turnSeconds: turn, note: note)
     case "failure":
@@ -550,6 +579,9 @@ enum Health {
         lines += ((try? String(contentsOf: configURL, encoding: .utf8)) ?? "(missing)")
             .split(separator: "\n").filter { !$0.hasPrefix("#") }.map { "  \($0)" }
         lines += ["", "Sessions: \(sessions.filter { $0.status == .needsInput }.count) need input, \(sessions.filter { $0.status == .finished }.count) finished"]
+        // Counts only: Mac names can be personal, and this report gets pasted into issues.
+        let peers = PeerStore.load().peers.count
+        lines += ["Other Macs: \(config.otherMacs ? "on" : "off"), \(peers) paired"]
         lines += ["", "Recent events:"] + EventLog.tail(40).map { "  \($0)" }
         return lines.joined(separator: "\n")
     }
@@ -573,18 +605,30 @@ extension String {
 @MainActor
 final class AppModel: ObservableObject {
     @Published var config = Config.load() {
-        didSet { if config != oldValue { config.save(); onChange?() } }
+        didSet { if config != oldValue { if persist { config.save() }; onChange?() } }
     }
-    @Published var sessions: [SessionState] = []
+    /// False only for snapshots, so sample settings never reach the real config file.
+    var persist = true
+    @Published var sessions: [SessionState] = []          // this Mac's sessions
+    @Published var remote: [String: [SessionState]] = [:] // sessions from paired Macs, by peer ID
+    /// Remote session states you dismissed here ("id@updatedAt"); they stay hidden until they change.
+    private var hiddenRemote: Set<String> = []
+    let peers: PeerService
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published var health: [HealthCheck] = []
     @Published var repairMessage: String?
     var onChange: (() -> Void)?
     private var player: NSSound?
 
-    var needsInput: [SessionState] { sessions.filter { $0.status == .needsInput } }
-    var finished: [SessionState] { sessions.filter { $0.status == .finished } }
-    var working: [SessionState] { sessions.filter { $0.status == .working } }
+    init(peers: PeerService? = nil) { self.peers = peers ?? PeerService() }
+
+    /// This Mac's sessions and those from paired Macs, newest first.
+    var allSessions: [SessionState] {
+        remote.isEmpty ? sessions : (sessions + remote.values.joined()).sorted { $0.updatedAt > $1.updatedAt }
+    }
+    var needsInput: [SessionState] { allSessions.filter { $0.status == .needsInput } }
+    var finished: [SessionState] { allSessions.filter { $0.status == .finished } }
+    var working: [SessionState] { allSessions.filter { $0.status == .working } }
     var hasHealthFailure: Bool { health.contains { $0.level == .fail } }
 
     var needsRepair: Bool { health.contains { $0.level == .fail || ($0.level == .warn && $0.id == "link") } }
@@ -627,13 +671,46 @@ final class AppModel: ObservableObject {
         flash("Diagnostics copied to the clipboard.")
     }
 
+    /// Called with every session, this Mac's and other Macs', before and after a change.
     var onSessionsChanged: ((_ old: [SessionState], _ new: [SessionState]) -> Void)?
     var onTestBanner: (() -> Void)?
 
     func reloadSessions() {
-        let old = sessions
+        let old = allSessions
         sessions = Sessions.all()
-        onSessionsChanged?(old, sessions)
+        onSessionsChanged?(old, allSessions)
+        peers.localSessionsChanged(sessions)
+        onChange?()
+    }
+
+    /// A paired Mac sent its sessions. The first snapshot from a Mac is the baseline: no banners.
+    func setRemote(_ peerID: String, _ list: [SessionState], baseline: Bool) {
+        let old = allSessions
+        let keys = Set(list.map(\.stateKey))
+        hiddenRemote = hiddenRemote.filter { !$0.hasPrefix(peerID + ":") || keys.contains($0) }
+        let visible = list.filter { !hiddenRemote.contains($0.stateKey) }
+        remote[peerID] = visible.isEmpty ? nil : visible
+        if !baseline { onSessionsChanged?(old, allSessions) }
+        onChange?()
+    }
+
+    func removeRemote(_ peerID: String) {
+        guard remote[peerID] != nil else { return }
+        let old = allSessions
+        remote[peerID] = nil
+        hiddenRemote = hiddenRemote.filter { !$0.hasPrefix(peerID + ":") }
+        onSessionsChanged?(old, allSessions)
+        onChange?()
+    }
+
+    /// Hides a session from another Mac here. It comes back if its state changes there.
+    func hideRemote(_ s: SessionState) {
+        guard let peer = s.remotePeer else { return }
+        let old = allSessions
+        hiddenRemote.insert(s.stateKey)
+        remote[peer]?.removeAll { $0.id == s.id }
+        if remote[peer]?.isEmpty == true { remote[peer] = nil }
+        onSessionsChanged?(old, allSessions)
         onChange?()
     }
 
@@ -811,6 +888,8 @@ struct SettingsView: View {
                 }
             }
 
+            OtherMacsSection(model: model, peers: model.peers)
+
             Section("General") {
                 Toggle("Launch at login", isOn: Binding(get: { model.launchAtLogin },
                                                         set: { model.setLaunchAtLogin($0) }))
@@ -931,6 +1010,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     var settingsWindow: NSWindow?
     var welcomeWindow: NSWindow?
+    var pairingWindow: NSWindow?
     weak var volumeLabel: NSTextField?
     var watcher: DispatchSourceFileSystemObject?
     var refreshTimer: Timer?
@@ -947,11 +1027,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !FileManager.default.fileExists(atPath: configURL.path) { model.config.save() }
         // Restore the bundled chimes if the sounds folder is gone (a fresh download, or it was deleted).
         if soundFiles(in: soundsDir).isEmpty { Installer.seedSounds() }
-        model.onChange = { [weak self] in self?.updateStatusButton() }
+        model.onChange = { [weak self] in
+            guard let self else { return }
+            self.model.peers.setEnabled(self.model.config.otherMacs)
+            self.updateStatusButton()
+        }
         banners.config = { [weak self] in self?.model.config ?? Config.load() }
         banners.onOpen = { [weak self] s in self?.open(s) }
         banners.onDismiss = { [weak self] s in if s.id != "test-banner" { self?.dismiss(s, in: nil) } }
         model.onTestBanner = { [weak self] in self?.showTestBanner() }
+        model.peers.onRemote = { [weak self] peer, list, baseline in self?.model.setRemote(peer, list, baseline: baseline) }
+        model.peers.onRemoteGone = { [weak self] peer in self?.model.removeRemote(peer) }
+        model.peers.onPairingChanged = { [weak self] in self?.updatePairingWindow() }
         // Sessions already waiting at launch are the baseline: no burst of banners on startup.
         model.reloadSessions()
         model.onSessionsChanged = { [weak self] old, new in self?.sessionsChanged(old: old, new: new) }
@@ -967,6 +1054,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.model.reloadConfig()
                 self?.model.reloadSessions()
                 self?.model.refreshHealth()
+                self?.model.peers.tick()
                 self?.remindAboutUnansweredPrompts()
             }
         }
@@ -1092,7 +1180,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func sessionItem(_ s: SessionState, symbol: String, tint: NSColor = .secondaryLabelColor, detail: String) -> NSMenuItem {
         let i = NSMenuItem(title: s.title, action: nil, keyEquivalent: "")
         i.representedObject = s
-        i.toolTip = s.cwd
+        i.toolTip = s.remoteHost.map { "Running on \($0). Open it on that Mac. Clicking clears it here." } ?? s.cwd
+        let detail = s.remoteHost.map { "\(detail) · on \($0)" } ?? detail
         i.view = SessionRowView(title: s.title, subtitle: detail, symbol: symbol, iconTint: tint,
                                 onOpen: { [weak self] in self?.open(s) },
                                 onDismiss: { [weak self, weak i] in self?.dismiss(s, in: i?.menu) })
@@ -1109,16 +1198,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let prev = before[s.id]
             let isNews = prev == nil || prev!.status != s.status || s.updatedAt.timeIntervalSince(prev!.updatedAt) > 0.5
             guard isNews else { continue }
+            if s.isRemote { chimeForRemote(s, config: c) }
             if s.status == .working { banners.remove(id: s.id, animated: true); continue }
             // Same rule as the Finished chime: short turns stay quiet unless they failed.
-            let shortTurn = s.status == .finished && !s.isFailed && c.finishedMinSeconds > 0
-                && (s.turnSeconds ?? .infinity) < Double(c.finishedMinSeconds)
+            let shortTurn = s.status == .finished && !s.isFailed && c.isShortTurn(s.turnSeconds)
             let wanted = !c.inQuietHours() && !shortTurn
                 && (c.banner == .all || (c.banner == .input && (s.status == .needsInput || s.isFailed)))
             if wanted { banners.show(s) } else { banners.remove(id: s.id, animated: true) }
         }
         let alive = Set(new.map(\.id))
         for id in banners.visibleIDs where !alive.contains(id) && id != "test-banner" { banners.remove(id: id, animated: true) }
+    }
+
+    /// This Mac's hook chimes for its own sessions. Sessions from another Mac chime here, by this Mac's settings.
+    func chimeForRemote(_ s: SessionState, config c: Config) {
+        let (path, note) = c.remoteChime(for: s)
+        if let path { model.preview(path) }
+        guard s.status != .working else { return }
+        EventLog.append("remote peer=\(s.remotePeer?.prefix(8) ?? "-") status=\(s.status.rawValue)\(s.isFailed ? " failed" : "") chime=\(note)")
     }
 
     /// Keys ("id@updatedAt") of prompts already reminded about, so each gets one reminder.
@@ -1145,9 +1242,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func dismiss(_ s: SessionState, in menu: NSMenu?) {
-        Sessions.remove(s.id)
-        EventLog.append("dismiss session=\(s.id.prefix(8)) status=\(s.status.rawValue)")
-        model.reloadSessions()
+        if s.isRemote {
+            // Only hidden here; the other Mac keeps its own list.
+            model.hideRemote(s)
+        } else {
+            Sessions.remove(s.id)
+            EventLog.append("dismiss session=\(s.id.prefix(8)) status=\(s.status.rawValue)")
+            model.reloadSessions()
+        }
         if let menu { build(menu) }
     }
 
@@ -1190,12 +1292,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func clearFinished() {
         Sessions.clearFinished()
+        model.finished.filter(\.isRemote).forEach(model.hideRemote)
         model.reloadSessions()
     }
 
     /// Opens the session: desktop chats open directly via the Claude app's `claude://code/continue` link;
     /// CLI sessions (and older entries without a desktop ID) bring their app to the front.
     func open(_ s: SessionState) {
+        // A session on another Mac can't be opened from here, so clicking it just clears it.
+        if s.isRemote { model.hideRemote(s); return }
         if let link = s.desktopLink, NSWorkspace.shared.open(link) {
             EventLog.append("open session=\(s.id.prefix(8)) via=desktop-link")
             return
@@ -1248,6 +1353,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         model.launchAtLogin = SMAppService.mainApp.status == .enabled
         NSApp.activate()
         settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Shows the pairing window while a pairing is in progress, on both Macs.
+    func updatePairingWindow() {
+        guard let p = model.peers.pairing else {
+            pairingWindow?.close()
+            pairingWindow = nil
+            return
+        }
+        let w = pairingWindow ?? {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 260),
+                             styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            w.title = "Pair with Another Mac"
+            w.isReleasedWhenClosed = false
+            w.level = .floating
+            NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, self.pairingWindow === w else { return }
+                    self.pairingWindow = nil
+                    self.model.peers.cancelPairing()
+                }
+            }
+            return w
+        }()
+        w.contentView = NSHostingView(rootView: PairingView(session: p,
+            onPair: { [weak self] in self?.model.peers.confirmPairing() },
+            onClose: { [weak self] in self?.model.peers.cancelPairing() }))
+        if pairingWindow == nil {
+            pairingWindow = w
+            w.center()
+        }
+        NSApp.activate()
+        w.makeKeyAndOrderFront(nil)
     }
 
     @objc func quit() { NSApp.terminate(nil) }
@@ -1318,6 +1456,12 @@ if let i = args.firstIndex(of: "--render-app-icon"), i + 1 < args.count {
     exit(0)
 }
 
+// Hidden checks for Other Macs (see PeerTests.swift):
+//   --peer-selftest        message encoding, sealing, rejection and pairing codes, in memory (no network)
+//   --peer-loopback-test   two in-process peers pair and sync over 127.0.0.1 (opens loopback sockets; not run in CI)
+if args.contains("--peer-selftest") { exit(PeerTests.selftest() ? 0 : 1) }
+if args.contains("--peer-loopback-test") { exit(MainActor.assumeIsolated { PeerTests.loopback() } ? 0 : 1) }
+
 // `ClaudeChimes --snapshot-icons out.png` renders the menu bar icon's badge states on light and dark bars.
 if let i = args.firstIndex(of: "--snapshot-icons"), i + 1 < args.count {
     MainActor.assumeIsolated {
@@ -1382,6 +1526,7 @@ if let i = args.firstIndex(of: "--snapshot-rows"), i + 1 < args.count {
                            symbol: "exclamationmark.bubble.fill", iconTint: .systemRed, onOpen: {}, onDismiss: {}),
             SessionRowView(title: "Write the release notes", subtitle: "Finished 4 min ago", symbol: "checkmark.bubble", onOpen: {}, onDismiss: {}),
             SessionRowView(title: "Refactor the settings parser", subtitle: "Finished 12 min ago", symbol: "checkmark.bubble", onOpen: {}, onDismiss: {}),
+            SessionRowView(title: "Update the README", subtitle: "Finished 2 min ago · on Mac mini", symbol: "checkmark.bubble", onOpen: {}, onDismiss: {}),
         ]
         let w: CGFloat = 320, h = CGFloat(rows.count) * SessionRowView.height + 12
         let panel = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
@@ -1413,9 +1558,10 @@ if let i = args.firstIndex(of: "--snapshot-banner"), i + 1 < args.count {
     MainActor.assumeIsolated {
         _ = NSApplication.shared
         let dark = args.contains("--dark"), finished = args.contains("--finished")
-        let s = SessionState(id: "demo", status: finished ? .finished : .needsInput,
+        var s = SessionState(id: "demo", status: finished ? .finished : .needsInput,
                              title: finished ? "Write the release notes" : "Fix the login redirect", cwd: "",
                              message: finished ? nil : "Claude needs your permission to use Bash", appBundleID: nil, updatedAt: Date())
+        if args.contains("--remote") { s.remotePeer = "demo"; s.remoteHost = "Mac mini" }
         let pad: CGFloat = 20
         let canvas = NSView(frame: NSRect(x: 0, y: 0, width: BannerView.size.width + 2 * pad, height: BannerView.size.height + 2 * pad))
         canvas.wantsLayer = true
@@ -1447,8 +1593,17 @@ if let i = args.firstIndex(of: "--snapshot-banner"), i + 1 < args.count {
 if let i = args.firstIndex(of: "--snapshot-settings"), i + 1 < args.count {
     MainActor.assumeIsolated {
         _ = NSApplication.shared
-        let view = NSHostingView(rootView: SettingsView(model: AppModel(), height: 1500))
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 1500),
+        // Sample Macs, never the real ones; the service isn't started, so nothing touches the network.
+        let peers = PeerService(storeURL: URL(fileURLWithPath: "/dev/null"), hostName: "This Mac", advertise: false)
+        peers.loadDemo()
+        let model = AppModel(peers: peers)
+        model.persist = false
+        model.config.otherMacs = true
+        model.remote = ["demo-1": [WireSession(SessionState(id: "d", status: .finished, title: "Sample", cwd: "",
+                                                            message: nil, appBundleID: nil, updatedAt: Date()))
+            .session(peerID: "demo-1", host: "MacBook Pro")]]
+        let view = NSHostingView(rootView: SettingsView(model: model, height: 1820))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 1820),
                               styleMask: [.titled], backing: .buffered, defer: false)
         window.contentView = view
         window.appearance = NSAppearance(named: args.contains("--dark") ? .darkAqua : .aqua)

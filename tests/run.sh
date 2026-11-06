@@ -140,6 +140,18 @@ SIZE=$(stat -f %z "$HOME/.claude/chimes/events.log")
 check "log rotates under 256 KB ($SIZE bytes)" '[ $SIZE -lt 262144 ]'
 check "newest event survives rotation" 'tail -1 "$HOME/.claude/chimes/events.log" | grep -q "prompt session=rot"'
 
+section "Other Macs"
+# In-memory checks only: no listener, no Bonjour (see app/Sources/PeerTests.swift).
+lim "$BIN" --peer-selftest </dev/null >"$WORK/peer.txt" 2>&1; RC=$?
+check "peer self-test passes ($(grep -c '^ok' "$WORK/peer.txt") checks)" '[ $RC = 0 ] && ! grep -q "^FAIL" "$WORK/peer.txt"'
+[ $RC = 0 ] || grep -v "^ok" "$WORK/peer.txt" | sed 's/^/       /'
+check "rejects tampered, relabeled, stale and replayed messages" 'grep -q "^ok   tampered box is rejected" "$WORK/peer.txt" && grep -q "^ok   replayed message is rejected" "$WORK/peer.txt" && grep -q "^ok   stale message is rejected" "$WORK/peer.txt" && grep -q "^ok   box relabeled" "$WORK/peer.txt"'
+check "Other Macs is off by default" 'lim "$BIN" --doctor </dev/null | grep -q "Other Macs: off, 0 paired"'
+echo "otherMacs=1" >> "$HOME/.claude/chimes/config"
+check "Other Macs setting is read from config" 'lim "$BIN" --doctor </dev/null | grep -q "Other Macs: on, 0 paired"'
+sed -i '' '/^otherMacs=/d' "$HOME/.claude/chimes/config"
+check "the hook never creates peers.json" '[ ! -e "$HOME/.claude/chimes/peers.json" ]'
+
 section "Uninstall"
 cp "$ROOT/tests/fixtures/settings.json" "$SETTINGS"
 lim "$BIN" --setup </dev/null >/dev/null

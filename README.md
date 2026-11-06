@@ -28,7 +28,9 @@ The menu bar lists the sessions waiting on you. Some need your input, with the q
 
 The menu also has volume and mute. It can also show a small on-screen banner when a session needs you or finishes, naming the session and what it's waiting for. Everything else lives in a Settings window, where you can pick each sound from the bundled chimes, your own files or the macOS sounds, preview it, and check that the setup is healthy. To add your own sounds, drop any `.wav`, `.aiff`, `.mp3`, `.m4a` or `.caf` file into `~/.claude/chimes/sounds`.
 
-The chimes play straight from the hooks, so they work even when the menu bar app isn't running. Nothing leaves your Mac.
+The chimes play straight from the hooks, so they work even when the menu bar app isn't running.
+
+If you use Claude Code on more than one Mac, turn on Other Macs. A session on one Mac then shows, chimes and pops up a banner on your other paired Macs on the same network, so you hear it on the Mac you're sitting at. It's off by default, and until you turn it on nothing leaves your Mac.
 
 ## Requirements
 
@@ -81,13 +83,14 @@ A session leaves the list when you reply, approve the tool it asked about, or cl
   <img src="docs/settings.png" alt="The Settings window" width="420">
 </p>
 
-The Settings window has seven sections:
+The Settings window has eight sections:
 
 - Sounds: the Needs input, Finished and Turn failed sounds, each with a play button.
 - When to Chime: how long a turn must run before Finished chimes (every reply, or after 15 seconds up to 5 minutes), the reminder for an unanswered prompt (off, or after 2 to 15 minutes), an optional cue before Claude compacts the conversation, and quiet hours.
 - Volume: the slider and Mute.
 - Menu Bar: what the badge counts (Needs input and finished, Needs input only, or Off), and whether finished and working sessions are listed.
 - Banners: which sessions pop up a banner (needs input and finished, needs input only, or off), where it appears (top right, top center or bottom right), and how long it stays (4, 8 or 15 seconds, or until you dismiss it), plus a Show Test Banner button. Clicking a banner opens the session, and its × dismisses it. A banner waits while your pointer is over it, and closes by itself once you reply.
+- Other Macs: share sessions with your other Macs, the Macs you've paired (with Unpair), and Macs nearby you can pair. See [Other Macs](#other-macs).
 - General: Launch at Login, a button that opens the sounds folder, and Uninstall.
 - Health: whether the hooks are installed, the hook link points at this app, your sounds exist, and hook events are arriving. Repair fixes the setup, Copy Diagnostics copies a report for bug reports, and Show Log opens the event log. When a check fails, the menu shows a Setup needs attention item.
 
@@ -113,7 +116,27 @@ showWorking=1
 banner=all
 bannerPosition=topRight
 bannerSeconds=8
+otherMacs=0
 ```
+
+### Other Macs
+
+Claude Code hooks only run on the Mac running the session. If a session runs on your Mac mini while you're at your MacBook, the MacBook stays silent. Other Macs fixes that:
+
+1. Turn on Settings → Other Macs → "Share sessions with my other Macs" on both Macs. Both need Claude Chimes 1.7 or later, running, and on the same network.
+2. On one Mac, click Pair… next to the other Mac.
+3. A window opens on both Macs with a six-digit code. Check that the codes match, then click Pair on both. If they don't match, click Cancel.
+
+Sessions from the other Mac then appear in the same menu sections, with "on Mac mini" (or that Mac's name) in the subtitle. They chime and show banners by this Mac's settings: its sounds, volume, mute, quiet hours and the Finished threshold. A session on another Mac can't be opened from here, so clicking its row or banner just clears it on this Mac. It comes back if its state changes. A Mac that goes quiet for about two minutes, because it slept or left the network, drops out of the menu until it's back.
+
+What's shared, and with whom:
+
+- Only Macs you've paired get anything. A Mac you haven't paired can see that this Mac runs Claude Chimes, through Bonjour, but nothing else.
+- For each session, the other Mac gets its status, title, folder name (not the full path), prompt message, whether it failed, its turn length and its timestamps. Process IDs, terminals, transcript paths and desktop chat IDs stay on the Mac.
+- Each message is encrypted and authenticated with a key only the pair has (ChaChaPoly). Pairing agrees that key with X25519 and shows the code, so someone else on the network can't slip in between. Old or replayed messages are rejected.
+- Paired Macs and their keys are in `~/.claude/chimes/peers.json`, readable only by you. Unpair removes the other Mac on both sides when it's reachable.
+
+The first time you turn it on, macOS asks to let Claude Chimes find devices on your local network. If your Mac's firewall is on, it also asks whether Claude Chimes may accept incoming connections. Allow both, or your other Macs can't reach this one. The app is ad-hoc signed rather than notarized, so macOS may ask again after each update. You can change both later in System Settings → Privacy & Security → Local Network, and Network → Firewall → Options.
 
 ## How it works
 
@@ -133,6 +156,8 @@ Claude Code runs [hooks](https://docs.claude.com/en/docs/claude-code/hooks) on l
 
 Each waiting session is a small JSON file in `~/.claude/chimes/sessions`. It holds the session ID, the title from the session's local transcript, its folder, the prompt message, its Claude process ID and terminal, the turn's start time and length, and for desktop chats the desktop app's chat ID. A file is deleted after a day, or as soon as its process exits. Finished desktop sessions are the exception: the desktop app can restart their process when you reply, so they stay for the full day. Entries without a process ID also stay for the day. Hook events are logged to `~/.claude/chimes/events.log`, which is capped at 256 KB.
 
+With Other Macs on, the menu bar app (not the hooks) advertises `_claudechimes._tcp` over Bonjour and listens on a port the system picks. Whenever this Mac's sessions change, and every 30 seconds, it sends each paired Mac it can see a full, encrypted list of its sessions. The receiving app keeps that list in memory only.
+
 ## Troubleshooting
 
 Start with Settings → Health. From a terminal you can also run:
@@ -144,13 +169,15 @@ Start with Settings → Health. From a terminal you can also run:
 ~/.claude/chimes/chime-hook --dismiss <id>   # remove one session from the list (an ID prefix works)
 ```
 
+If Other Macs doesn't find your other Mac, check that both Macs have it turned on, are on the same network, and are allowed under System Settings → Privacy & Security → Local Network. If the firewall is on, Claude Chimes must be allowed to accept incoming connections, under Network → Firewall → Options. Some office and guest networks block Bonjour between devices.
+
 If a session that was already open stays silent, restart it so it loads the hooks. If you moved the app, it relinks itself the next time it launches. If another tool rewrote `settings.json`, use Repair, which adds back only the Claude Chimes hooks.
 
 To avoid hearing two sounds at once, turn off the desktop app's own notification sound: in the Claude desktop app, set Settings → Claude Code → Notification sound to None, or turn off "Play sound for notifications" under System Settings → Notifications → Claude. Banners still show. Leave your Mac's main volume alone, since the chimes play through it.
 
 ## Development
 
-`tests/run.sh` builds the app into a throwaway home folder and checks setup, every hook event, session pruning, the health check, log rotation and uninstall. It never touches your real `~/.claude` or the copy of the app you're running. CI runs it on every pull request.
+`tests/run.sh` builds the app into a throwaway home folder and checks setup, every hook event, session pruning, the health check, log rotation, Other Macs' message encryption and pairing math (in memory, with no network), and uninstall. It never touches your real `~/.claude` or the copy of the app you're running. CI runs it on every pull request. `ClaudeChimes --peer-loopback-test` pairs two copies in one process and syncs them over 127.0.0.1. It opens local sockets, so CI doesn't run it.
 
 To publish a release, bump `CFBundleShortVersionString` in `app/Info.plist`, add a section to [`CHANGELOG.md`](CHANGELOG.md), and push a matching tag such as `v1.4.0`. The release workflow tests, builds the universal app, and attaches the zip.
 
@@ -160,7 +187,7 @@ To change the sounds, edit the notes, instruments and timing in [`sounds/generat
 
 To change the menu bar icon, replace [`assets/menubar.svg`](assets/menubar.svg) and `menubar-muted.svg` (18×18, black on transparent), then run `app/build.sh`.
 
-The app's code is in [`app/Sources`](app/Sources): `main.swift` has the menu, the Settings window and hook mode, `Installer.swift` handles setup and removal, `OrderedJSON.swift` edits `settings.json` without reordering it, `Welcome.swift` has the first-run window and Uninstall, and `AppIcon.swift` draws the icon (`--render-app-icon`). Rebuild with `app/build.sh`. The hook link points into the app, so hooks pick up the new build automatically. [`DESIGN.md`](DESIGN.md) describes the visual and interaction rules the app follows.
+The app's code is in [`app/Sources`](app/Sources): `main.swift` has the menu, the Settings window and hook mode, `Installer.swift` handles setup and removal, `OrderedJSON.swift` edits `settings.json` without reordering it, `Welcome.swift` has the first-run window and Uninstall, `Peers.swift` and `OtherMacsUI.swift` are Other Macs (`PeerTests.swift` has its checks), and `AppIcon.swift` draws the icon (`--render-app-icon`). Rebuild with `app/build.sh`. The hook link points into the app, so hooks pick up the new build automatically. [`DESIGN.md`](DESIGN.md) describes the visual and interaction rules the app follows.
 
 ## Uninstall
 
