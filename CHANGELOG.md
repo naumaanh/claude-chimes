@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.8.0] - 2026-11-26
+
+### Added
+- Permission dialogs chime through Claude Code's `PermissionRequest` hook as well as `Notification`. In the Claude desktop app, `Notification` sometimes misses permission prompts; `PermissionRequest` fires for every one. When both fire for the same prompt, you hear one chime. The menu shows what Claude is asking, such as "Claude wants to run: npm test". The hook never answers the dialog.
+- Add Sound… at the bottom of each sound menu in Settings. It copies the file you choose into the sounds folder and uses it for that event.
+- Each session in the menu shows how full its context is, such as "182k context", read from the end of its transcript. Turn it off in Settings → Menu Bar.
+- Health warns about Claude sessions that started before Claude Chimes last changed its hooks. Claude Code reads hooks only when a session starts, so those sessions miss the new ones until you restart them.
+- Install with Homebrew: this repository is its own tap (see Install).
+- Banners lead with a verdict: "Done · nothing needs you", "Needs your decision", "Needs your permission", "Needs your answer" or "Turn failed", with a matching icon and color. The body is one line of status (the recap's first sentence), then the question if there is one.
+- A work receipt on Finished banners: "Edited 6 files · tests passed · 2 unpushed commits", from the turn's own tool calls (only ones that succeeded, and only commands that actually ran, so a script that merely mentions `git commit` doesn't count).
+- Allow or deny a permission prompt from its banner (Settings → Banners, off by default). When you're away from the session, the banner shows Allow once and Deny and Claude waits up to a minute for your click; switch to the session, or don't click, and you get Claude's own dialog. An answer covers that one request; no rule is added. The permission hook's entry gets a 75-second timeout and a `--wait` flag, and sessions started before the update never wait.
+- A digest: when a third banner would stack up, they fold into one card ("1 needs you · 2 done", one line per session, most urgent first). Permission banners with buttons stay separate.
+- A banner's countdown only runs while you're at the Mac. If there has been no keyboard or mouse input for 10 seconds when it would close, it stays up and gets its full time once you're back.
+- Session files and the `~/.claude/chimes` folder are now readable by your account only, since they can hold the start of Claude's replies.
+- Richer banners. A Finished banner summarizes the turn: in the Claude desktop app's Code tab it shows Claude's own end-of-turn recap (what is done, what is still open), up to three lines, and any question Claude left you on its own line, in the accent color, under "Waiting on your answer". Elsewhere it shows the start of the reply, with a closing question pulled out the same way. A Needs input banner shows the whole question or command. A small line underneath gives how long the turn took, how full the context is, and the project folder. Banners grow to fit, and stacked banners still line up. Settings → Banners → "Preview Claude's reply in banners" turns the reply off, for screen sharing. Replies are never sent to other Macs.
+
+### Changed
+- Setup keeps the five newest of its `settings.json` backups and deletes older ones. Backups made by other tools are left alone.
+
 ## [1.7.0] - 2026-11-06
 
 ### Added

@@ -13,6 +13,7 @@
 import AppKit
 import ServiceManagement
 import SwiftUI
+import UniformTypeIdentifiers
 
 let homeDir = URL(fileURLWithPath: ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory())
 let chimesDir = homeDir.appendingPathComponent(".claude/chimes")
@@ -43,9 +44,12 @@ struct Config: Equatable {
     var badge = Badge.all     // what the number badge on the menu bar icon counts
     var showFinished = true   // list sessions that finished and are waiting for your reply
     var showWorking = true    // list sessions Claude is working on right now
+    var showContext = true    // 1.8: "421k context" on each session row
     var banner = Badge.all    // which sessions pop up an on-screen banner (same three choices as the badge)
     var bannerPosition = BannerPosition.topRight
     var bannerSeconds = 8     // 0 keeps a banner until you dismiss it
+    var bannerPreview = true  // 1.8: the start of Claude's reply in Finished banners
+    var bannerActions = false // 1.8: Allow/Deny on permission banners (off unless you turn it on)
     var finishedMinSeconds = 30   // only chime/banner Finished for turns at least this long (0 = always)
     var reminderMinutes = 5       // remind once about a prompt left unanswered this long (0 = off)
     var compactChime = false      // a soft cue when Claude is about to compact the conversation
@@ -138,6 +142,9 @@ struct Config: Equatable {
             case "showCount": if !on { c.badge = .off }   // 1.1 setting; replaced by badge
             case "showFinished": c.showFinished = on
             case "showWorking": c.showWorking = on
+            case "showContext": c.showContext = on
+            case "bannerPreview": c.bannerPreview = on
+            case "bannerActions": c.bannerActions = on
             case "banner": c.banner = Badge(rawValue: v) ?? c.banner
             case "bannerPosition": c.bannerPosition = BannerPosition(rawValue: v) ?? c.bannerPosition
             case "bannerSeconds": c.bannerSeconds = max(0, min(120, Int(v) ?? c.bannerSeconds))
@@ -158,6 +165,9 @@ struct Config: Equatable {
         badge=\(badge.rawValue)
         showFinished=\(showFinished ? 1 : 0)
         showWorking=\(showWorking ? 1 : 0)
+        showContext=\(showContext ? 1 : 0)
+        bannerPreview=\(bannerPreview ? 1 : 0)
+        bannerActions=\(bannerActions ? 1 : 0)
         banner=\(banner.rawValue)
         bannerPosition=\(bannerPosition.rawValue)
         bannerSeconds=\(bannerSeconds)
@@ -213,6 +223,13 @@ struct SessionState: Codable, Identifiable {
     // Added in 1.7, only for sessions from another Mac (never written to disk by the hook):
     var remotePeer: String?    // the paired Mac's peer ID
     var remoteHost: String?    // its name, for "on Mac mini"
+    // Added in 1.8 (local only: Other Macs never sends it):
+    var reply: String? = nil   // the turn's recap, or the start of Claude's last reply, for the banner
+    var ask: String? = nil     // a question Claude left you at the end of the turn
+    var replyIsRecap: Bool? = nil
+    var askedVia: [String]? = nil  // which of Notification and PermissionRequest reported this prompt
+    var receipt: String? = nil     // what the turn did: "Edited 6 files · tests passed · 1 commit"
+    var decisionToken: String? = nil   // a permission prompt the banner may answer (see "permission")
 
     var isFailed: Bool { failed == true }
     var isRemote: Bool { remotePeer != nil }
@@ -271,6 +288,67 @@ enum ProcessCheck {
         return s.hasPrefix("tty") ? "/dev/" + s : nil
     }
 
+    /// Start times of this user's running Claude Code processes, by PID. Found by process
+    /// name, so it sees sessions whether or not any hook has run in them yet.
+    /// The process name to look for. The tests point it at a stand-in so the
+    /// Claude sessions running on the machine don't affect them.
+    static let processName = ProcessInfo.processInfo.environment["CLAUDE_CHIMES_PROCESS_NAME"] ?? "claude"
+
+    static func claudeProcesses() -> [Int32: Double] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_UID, Int32(getuid())]
+        var size = 0
+        guard sysctl(&mib, 4, nil, &size, nil, 0) == 0, size > 0 else { return [:] }
+        let count = size / MemoryLayout<kinfo_proc>.stride + 16   // room for processes started meanwhile
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: count)
+        size = count * MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&mib, 4, &procs, &size, nil, 0) == 0 else { return [:] }
+        var out: [Int32: Double] = [:]
+        for p in procs.prefix(size / MemoryLayout<kinfo_proc>.stride) {
+            let name = withUnsafeBytes(of: p.kp_proc.p_comm) { raw in
+                String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+            }
+            guard name == processName || (processName == "claude" && name == "node" && isClaudeNode(p.kp_proc.p_pid)) else { continue }
+            let tv = p.kp_proc.p_starttime
+            out[p.kp_proc.p_pid] = Double(tv.tv_sec) + Double(tv.tv_usec) / 1_000_000
+        }
+        return out
+    }
+
+    /// Claude Code installed with npm runs as `node …/@anthropic-ai/claude-code/cli.js`.
+    static func isClaudeNode(_ pid: Int32) -> Bool {
+        arguments(pid).dropFirst().first.map { $0.contains("@anthropic-ai/claude-code") || $0.hasSuffix("/bin/claude") } ?? false
+    }
+
+    /// A process's arguments (argv), or [] when they can't be read.
+    static func arguments(_ pid: Int32) -> [String] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return [] }
+        var buffer = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0 else { return [] }
+        let argc = buffer.withUnsafeBytes { $0.load(as: Int32.self) }
+        // After argc: the executable path, padding NULs, then argc NUL-terminated strings.
+        var i = MemoryLayout<Int32>.size
+        while i < size, buffer[i] != 0 { i += 1 }
+        while i < size, buffer[i] == 0 { i += 1 }
+        var args: [String] = []
+        while args.count < Int(argc), i < size {
+            let start = i
+            while i < size, buffer[i] != 0 { i += 1 }
+            args.append(String(decoding: buffer[start..<i], as: UTF8.self))
+            i += 1
+        }
+        return args
+    }
+
+    /// A `claude` process that is a conversation, not a one-shot `claude -p` run or a
+    /// `claude mcp …` server: only conversations wait on you, so only they matter here.
+    static func isSession(_ pid: Int32) -> Bool {
+        let args = arguments(pid).dropFirst()
+        if args.first == "mcp" { return false }
+        return !args.contains("-p") && !args.contains("--print")
+    }
+
     static func isAlive(pid: Int32, startedAt: Double?) -> Bool {
         guard let now = startTime(pid) else { return false }
         guard let startedAt else { return true }
@@ -291,9 +369,18 @@ enum Sessions {
         return try? decoder.decode(SessionState.self, from: d)
     }
 
+    /// Session files hold message text and, since 1.8, the start of Claude's replies. The
+    /// home folder lets other accounts in the staff group look inside, so the chimes folder
+    /// and the files are this account's alone.
     static func write(_ s: SessionState) {
-        try? FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
-        if let d = try? encoder.encode(s) { try? d.write(to: url(s.id), options: .atomic) }
+        let fm = FileManager.default
+        try? fm.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+        for dir in [chimesDir, sessionsDir] { try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path) }
+        guard let d = try? encoder.encode(s) else { return }
+        let target = url(s.id)
+        if (try? d.write(to: target, options: .atomic)) != nil {
+            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+        }
     }
 
     static func remove(_ id: String) { try? FileManager.default.removeItem(at: url(id)) }
@@ -330,6 +417,263 @@ enum Sessions {
 
     static let encoder: JSONEncoder = { let e = JSONEncoder(); e.dateEncodingStrategy = .secondsSince1970; return e }()
     static let decoder: JSONDecoder = { let d = JSONDecoder(); d.dateDecodingStrategy = .secondsSince1970; return d }()
+}
+
+/**
+ How full a session's context is, from its transcript: the input of the last reply,
+ counting what came from the cache. Shown as "421k context", not a percentage, because
+ the window differs by model and plan, and a guessed denominator would mislead.
+ Reads only the end of the file, so a long transcript costs no more than a short one.
+ */
+enum ContextUse {
+    static func tokens(_ path: String?) -> Int? {
+        guard let path, let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        let window: UInt64 = 512 * 1024
+        try? handle.seek(toOffset: size > window ? size - window : 0)
+        guard let data = try? handle.readToEnd(), let text = String(data: data, encoding: .utf8) else { return nil }
+        for line in text.split(separator: "\n").reversed() where line.contains("\"usage\"") && line.contains("\"assistant\"") {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let message = obj["message"] as? [String: Any],
+                  let usage = message["usage"] as? [String: Any] else { continue }
+            let parts = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+            let total = parts.compactMap { (usage[$0] as? NSNumber)?.intValue }.reduce(0, +)
+            if total > 0 { return total }
+        }
+        return nil
+    }
+
+    /// Labels already worked out, keyed by path, and checked against the file's size and
+    /// modification time, so opening the menu reads a transcript only when it has changed.
+    @MainActor private static var cache: [String: (stamp: String, label: String?)] = [:]
+
+    @MainActor static func cachedLabel(_ path: String?) -> String? {
+        guard let path, let a = try? FileManager.default.attributesOfItem(atPath: path) else { return nil }
+        let stamp = "\((a[.size] as? NSNumber)?.intValue ?? 0)@\((a[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)"
+        if let hit = cache[path], hit.stamp == stamp { return hit.label }
+        let value = label(path)
+        cache[path] = (stamp, value)
+        return value
+    }
+
+    static func label(_ path: String?) -> String? {
+        guard let n = tokens(path) else { return nil }
+        return n >= 1000 ? "\(Int((Double(n) / 1000).rounded()))k context" : "\(n) context"
+    }
+}
+
+/**
+ What a Finished banner says: a summary of the turn, and the question Claude left you, if any.
+
+ The Claude desktop app's Code tab ends each turn with a recap (what is now done, what is
+ still open) and sometimes one question, which it records in the transcript as a
+ `mcp__ccd_turn__wrap_up` tool call. That is the summary when it exists: instant and free.
+ Elsewhere (the CLI) it falls back to the start of the reply, with a closing question in
+ the reply pulled out on its own. Markdown is dropped and space folded either way.
+ */
+enum ReplyPreview {
+    static let maxLength = 300
+
+    struct Summary: Equatable {
+        var text: String?
+        var ask: String?
+        /// The text is Claude's own recap of the turn, not the start of its reply.
+        var isRecap = false
+        /// What the turn did, from its tool calls: "Edited 6 files · tests passed · 1 commit".
+        var receipt: String?
+    }
+
+    /// The first sentence: the recap's one-line status ("The banner is easier to read.").
+    static func headline(_ text: String) -> String {
+        let pattern = #"^.+?[.!?](?=\s+[A-Z0-9"“(]|$)"#
+        guard let range = text.range(of: pattern, options: .regularExpression) else { return text }
+        return String(text[range])
+    }
+
+    static func clean(_ text: String, max: Int = maxLength) -> String? {
+        var t = text.replacingOccurrences(of: #"```[\s\S]*?```"#, with: " ", options: .regularExpression)
+        t = t.replacingOccurrences(of: #"(?m)^\s{0,3}(#{1,6}|>|[-*+]|\d+\.)\s+"#, with: "", options: .regularExpression)
+        t = t.replacingOccurrences(of: #"[*_`|]+"#, with: "", options: .regularExpression)
+        t = t.replacingOccurrences(of: #"\[([^\]]*)\]\([^)]*\)"#, with: "$1", options: .regularExpression)
+        t = t.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty else { return nil }
+        return t.count > max ? String(t.prefix(max - 1)) + "…" : t
+    }
+
+    /// A question the reply ends on, such as "Should I push the branch?", or nil.
+    static func closingQuestion(_ text: String) -> String? {
+        let paragraphs = text.components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard let last = paragraphs.last.flatMap({ clean($0, max: 160) }), last.hasSuffix("?") else { return nil }
+        // The last sentence only: "Done. Should I push it?" asks "Should I push it?".
+        let sentences = last.components(separatedBy: ". ")
+        return sentences.last.map { $0.hasSuffix("?") ? $0 : last }
+    }
+
+    static func from(payload: [String: Any], transcript: String?) -> Summary {
+        let tail = transcript.flatMap(readTail)
+        let receipt = tail.flatMap { Receipt.from(turn: turn(in: $0)) }
+        if let tail, var recap = recap(in: tail) {
+            recap.receipt = receipt
+            return recap
+        }
+        let reply = (payload["last_assistant_message"] as? String) ?? tail.flatMap(lastReply)
+        guard let reply else { return Summary(receipt: receipt) }
+        let ask = closingQuestion(reply)
+        // Don't spend the preview's lines on the question it shows on its own line. Both are
+        // cleaned first, so markdown in the question can't stop the match.
+        var body = clean(reply, max: .max) ?? ""
+        if let ask, let range = body.range(of: ask, options: .backwards) { body.removeSubrange(range) }
+        return Summary(text: clean(body), ask: ask, receipt: receipt)
+    }
+
+    /// The rows of the current turn: everything after the last message you typed.
+    static func turn(in lines: [String]) -> ArraySlice<String> {
+        for i in lines.indices.reversed() where lines[i].contains("\"user\"") {
+            if let obj = object(lines[i]), isPrompt(obj) { return lines[(i + 1)...] }
+        }
+        return lines[...]
+    }
+
+    // MARK: Reading the transcript
+
+    private static func readTail(_ path: String) -> [String]? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        let window: UInt64 = 1024 * 1024
+        try? handle.seek(toOffset: size > window ? size - window : 0)
+        guard let data = try? handle.readToEnd(), let text = String(data: data, encoding: .utf8) else { return nil }
+        return text.split(separator: "\n").map(String.init)
+    }
+
+    static func object(_ line: String) -> [String: Any]? {
+        try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+    }
+
+    /// A message you typed, which starts a turn. Tool results and injected notes are
+    /// "user" rows too, so they don't count.
+    private static func isPrompt(_ obj: [String: Any]) -> Bool {
+        guard obj["type"] as? String == "user", obj["isMeta"] as? Bool != true,
+              let content = (obj["message"] as? [String: Any])?["content"] else { return false }
+        let text: String
+        if let string = content as? String {
+            text = string
+        } else if let blocks = content as? [[String: Any]], !blocks.contains(where: { $0["type"] as? String == "tool_result" }),
+                  let first = blocks.first(where: { $0["type"] as? String == "text" })?["text"] as? String {
+            text = first
+        } else {
+            return false
+        }
+        // Notices the app adds during a turn (a background task finishing, a reminder) arrive
+        // as user rows too. They are part of the turn, so a recap before them still counts.
+        let injected = ["<task-notification>", "<system-reminder>", "<local-command", "<command-name>", "<bash-"]
+        let start = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !injected.contains { start.hasPrefix($0) }
+    }
+
+    /// The latest end-of-turn recap in this turn (after your last message), if any.
+    static func recap(in lines: [String]) -> Summary? {
+        for line in lines.reversed() {
+            if line.contains("\"user\""), let obj = object(line), isPrompt(obj) { return nil }
+            guard line.contains("mcp__ccd_turn__wrap_up"), let obj = object(line),
+                  let blocks = (obj["message"] as? [String: Any])?["content"] as? [[String: Any]] else { continue }
+            for block in blocks.reversed() where block["type"] as? String == "tool_use"
+                && (block["name"] as? String)?.hasSuffix("ccd_turn__wrap_up") == true {
+                let input = block["input"] as? [String: Any] ?? [:]
+                guard let recap = (input["recap"] as? String).flatMap({ clean($0) }) else { continue }
+                return Summary(text: recap, ask: (input["ask"] as? String).flatMap { clean($0, max: 160) }, isRecap: true)
+            }
+        }
+        return nil
+    }
+
+    private static func lastReply(_ lines: [String]) -> String? {
+        for line in lines.reversed() where line.contains("\"assistant\"") {
+            guard let obj = object(line), obj["type"] as? String == "assistant",
+                  let blocks = (obj["message"] as? [String: Any])?["content"] as? [[String: Any]] else { continue }
+            let joined = blocks.compactMap { $0["type"] as? String == "text" ? $0["text"] as? String : nil }
+                .joined(separator: "\n")
+            if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return joined }
+        }
+        return nil
+    }
+}
+
+/**
+ What a turn actually did, read from its tool calls rather than from what Claude said about
+ them: files it changed, whether its last test run passed, commits and pushes. Only calls
+ that succeeded count. "Edited 6 files · tests passed · 2 commits · not pushed".
+ */
+enum Receipt {
+    static let editTools: Set<String> = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+    /// A command that runs a test suite, matched at the start of one step of a command.
+    static let testPattern = #"^(\S*/)?(npm (run )?test|pnpm (run )?test|yarn test|bun test|npx (jest|vitest)|jest|vitest|pytest|python3? -m (pytest|unittest)|swift test|go test|cargo test|xcodebuild[^\n]* test|rspec|phpunit|mix test|make test|tests?/run\.sh|run-tests?)"#
+
+    /**
+     The commands a shell line runs, one per step: "cd app && git commit -m x; git push" is
+     ["cd app", "git commit -m x", "git push"]. A heredoc's body is text, not commands, so
+     only its first line counts; that's how a script that merely mentions `git commit` is
+     told apart from a commit. Leading `VAR=value` settings and a timeout wrapper are dropped.
+     */
+    static func steps(_ command: String) -> [String] {
+        var text = command
+        if text.contains("<<"), let first = text.split(separator: "\n", maxSplits: 1).first { text = String(first) }
+        // Quoted text (a commit message, a python -c script) is never a command of its own.
+        text = text.replacingOccurrences(of: #"'[^']*'|"(\\.|[^"\\])*""#, with: "''", options: .regularExpression)
+        return text.components(separatedBy: CharacterSet(charactersIn: "\n;|&()")).compactMap { raw in
+            var step = raw.trimmingCharacters(in: .whitespaces)
+            while let r = step.range(of: #"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+"#, options: .regularExpression) { step.removeSubrange(r) }
+            for wrapper in ["perl -e '' ", "timeout ", "./heavy.sh ", "env ", "time "] where step.hasPrefix(wrapper) {
+                step.removeFirst(wrapper.count)
+            }
+            return step.isEmpty ? nil : step
+        }
+    }
+
+    static func from(turn: ArraySlice<String>) -> String? {
+        var calls: [String: (tool: String, input: [String: Any])] = [:]
+        var failed: Set<String> = []
+        var order: [String] = []
+        for line in turn where line.contains("tool_use") || line.contains("tool_result") {
+            guard let obj = ReplyPreview.object(line),
+                  let blocks = (obj["message"] as? [String: Any])?["content"] as? [[String: Any]] else { continue }
+            for b in blocks {
+                guard let id = (b["id"] as? String) ?? (b["tool_use_id"] as? String) else { continue }
+                if b["type"] as? String == "tool_use", let name = b["name"] as? String {
+                    calls[id] = (name, b["input"] as? [String: Any] ?? [:])
+                    order.append(id)
+                } else if b["type"] as? String == "tool_result", b["is_error"] as? Bool == true {
+                    failed.insert(id)
+                }
+            }
+        }
+        var files: Set<String> = []
+        var commits = 0, pushed = false
+        var tests: Bool?   // the last test run: passed or not
+        for id in order {
+            guard let call = calls[id] else { continue }
+            let ok = !failed.contains(id)
+            if editTools.contains(call.tool), ok,
+               let path = (call.input["file_path"] as? String) ?? (call.input["notebook_path"] as? String) {
+                files.insert(path)
+            }
+            guard call.tool == "Bash", let command = call.input["command"] as? String else { continue }
+            let steps = Self.steps(command)
+            if steps.contains(where: { $0.range(of: testPattern, options: .regularExpression) != nil }) { tests = ok }
+            guard ok else { continue }
+            commits += steps.filter { $0.hasPrefix("git commit") || $0.range(of: #"^git -C \S+ commit"#, options: .regularExpression) != nil }.count
+            if steps.contains(where: { $0.hasPrefix("git push") || $0.range(of: #"^git -C \S+ push"#, options: .regularExpression) != nil }) { pushed = true }
+        }
+        var parts: [String] = []
+        if !files.isEmpty { parts.append("Edited \(files.count) file\(files.count == 1 ? "" : "s")") }
+        if let tests { parts.append(tests ? "tests passed" : "tests failed") }
+        let plural = commits == 1 ? "" : "s"
+        if commits > 0 { parts.append(pushed ? "\(commits) commit\(plural) pushed" : "\(commits) unpushed commit\(plural)") }
+        else if pushed { parts.append("pushed") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
 }
 
 /// The session's title as shown in the Claude app: the last "custom-title" entry in its transcript.
@@ -403,6 +747,92 @@ func playDetached(_ path: String, volume: Double) {
     p.waitUntilExit()
 }
 
+/**
+ Answering a permission prompt from the banner.
+
+ The PermissionRequest hook runs before Claude Code shows its dialog, and whatever it prints
+ decides. When you're away from the session, the hook marks the session with a one-time
+ token and waits; the banner shows Allow and Deny; a click writes the answer to
+ `decisions/<token>`, and the hook prints it. It steps aside (prints nothing, so the
+ dialog shows) as soon as you switch to the session's app, the menu bar app isn't running,
+ or `wait` runs out. An answer covers this one request only: no rule is ever added.
+ */
+enum Permission {
+    static let wait: TimeInterval = 60
+    static let appID = "io.github.naumaanh.claude-chimes"
+    static var dir: URL { chimesDir.appendingPathComponent("decisions") }
+
+    /// Whether to offer the banner's buttons for this prompt at all.
+    static func canAsk(config: Config, host: String?) -> Bool {
+        guard config.bannerActions, config.banner != .off, !config.inQuietHours(), appRunning else { return false }
+        return !isFront(host)
+    }
+
+    /// The menu bar app shows the banner, so without it there's nothing to wait for. The
+    /// tests set CLAUDE_CHIMES_APP_RUNNING, since they never run the app itself.
+    static var appRunning: Bool {
+        if let forced = ProcessInfo.processInfo.environment["CLAUDE_CHIMES_APP_RUNNING"] { return forced == "1" }
+        return !NSRunningApplication.runningApplications(withBundleIdentifier: appID).isEmpty
+    }
+
+    /// How long to wait; the tests shorten it with CLAUDE_CHIMES_PERMISSION_WAIT.
+    static var limit: TimeInterval {
+        ProcessInfo.processInfo.environment["CLAUDE_CHIMES_PERMISSION_WAIT"].flatMap(TimeInterval.init) ?? wait
+    }
+
+    /// The session's own app is in front, so you'll see the dialog: no reason to wait.
+    static func isFront(_ host: String?) -> Bool {
+        guard let host, let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else { return false }
+        return front == host
+    }
+
+    /// "allow" or "deny" from the banner, or nil when it should step aside.
+    static func wait(token: String, host: String?, limit: TimeInterval = limit) -> String? {
+        let file = dir.appendingPathComponent(token)
+        let end = Date().addingTimeInterval(limit)
+        defer { try? FileManager.default.removeItem(at: file) }
+        while Date() < end {
+            if let answer = try? String(contentsOf: file, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+               answer == "allow" || answer == "deny" { return answer }
+            if isFront(host) || !appRunning { return nil }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        return nil
+    }
+
+    /// Writes the banner's answer for the hook to pick up.
+    static func answer(token: String, behavior: String) {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let file = dir.appendingPathComponent(token)
+        try? Data(behavior.utf8).write(to: file, options: .atomic)
+        try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    }
+
+    /// The hook's answer to Claude Code, in its PermissionRequest output format.
+    static func output(_ behavior: String) -> String {
+        let decision: [String: Any] = behavior == "allow"
+            ? ["behavior": "allow"]
+            : ["behavior": "deny", "message": "Denied from the Claude Chimes banner."]
+        let out: [String: Any] = ["hookSpecificOutput": ["hookEventName": "PermissionRequest", "decision": decision]]
+        let data = (try? JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])) ?? Data()
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
+/// "Claude wants to run: npm test", from a PermissionRequest payload, in the words
+/// Claude Code's own notification uses.
+func permissionMessage(_ payload: [String: Any]) -> String {
+    let tool = payload["tool_name"] as? String ?? "a tool"
+    let input = payload["tool_input"] as? [String: Any] ?? [:]
+    let detail = (input["command"] as? String) ?? (input["file_path"] as? String)
+        ?? (input["url"] as? String) ?? (input["pattern"] as? String)
+    guard let detail, !detail.isEmpty else { return "Claude needs your permission to use \(tool)" }
+    let line = detail.split(separator: "\n").first.map(String.init) ?? detail
+    let short = line.count > 80 ? String(line.prefix(79)) + "…" : line
+    return tool == "Bash" ? "Claude wants to run: \(short)" : "Claude wants to use \(tool): \(short)"
+}
+
 func runHook(_ event: String) -> Never {
     let payload = (try? JSONSerialization.jsonObject(with: FileHandle.standardInput.readDataToEndOfFile())) as? [String: Any] ?? [:]
     let env = ProcessInfo.processInfo.environment
@@ -415,7 +845,8 @@ func runHook(_ event: String) -> Never {
 
     @discardableResult
     func record(_ status: SessionState.Status, message: String?, workingSince: Date? = nil,
-                turnSeconds: Double? = nil, failed: Bool = false, note: String = "") -> SessionState? {
+                turnSeconds: Double? = nil, failed: Bool = false, summary: ReplyPreview.Summary? = nil,
+                askedVia: [String]? = nil, decisionToken: String? = nil, note: String = "") -> SessionState? {
         guard !id.isEmpty else { return nil }
         let previous = Sessions.read(id)
         let folder = URL(fileURLWithPath: cwd).lastPathComponent
@@ -429,7 +860,9 @@ func runHook(_ event: String) -> Never {
                              workingSince: workingSince, turnSeconds: turnSeconds, failed: failed ? true : nil,
                              transcriptPath: transcript ?? previous?.transcriptPath,
                              tty: pid.flatMap(ProcessCheck.tty) ?? previous?.tty,
-                             termProgram: env["TERM_PROGRAM"] ?? previous?.termProgram)
+                             termProgram: env["TERM_PROGRAM"] ?? previous?.termProgram,
+                             reply: summary?.text, ask: summary?.ask, replyIsRecap: summary?.isRecap == true ? true : nil,
+                             askedVia: askedVia, receipt: summary?.receipt, decisionToken: decisionToken)
         Sessions.write(s)
         EventLog.append("\(event) session=\(short) status=\(status.rawValue) title=\"\(title)\"\(note)")
         return s
@@ -443,6 +876,19 @@ func runHook(_ event: String) -> Never {
         return " chime=played"
     }
 
+    /**
+     Notification and PermissionRequest can both report one permission dialog. The prompt is
+     the same one when the session started waiting in the last few seconds and this kind of
+     event hasn't reported it yet; then it records without a second chime. The same kind of
+     event again means a new prompt (say you denied one and Claude asked for something else).
+     Returns whether it's the same prompt, and the events that have now reported it.
+     */
+    func samePrompt(_ prev: SessionState?) -> (Bool, [String]) {
+        guard let prev, prev.status == .needsInput, Date().timeIntervalSince(prev.updatedAt) < 8,
+              let seen = prev.askedVia, !seen.isEmpty, !seen.contains(event) else { return (false, [event]) }
+        return (true, seen + [event])
+    }
+
     switch event {
     case "prompt":
         // You sent a message: the session is working, and the turn's clock starts.
@@ -454,8 +900,37 @@ func runHook(_ event: String) -> Never {
             EventLog.append("notification session=\(short) type=\(type) skipped")
             exit(0)
         }
-        record(.needsInput, message: payload["message"] as? String,
-               workingSince: Sessions.read(id)?.workingSince, note: chime(config.input))
+        // PermissionRequest may have chimed for this same prompt a moment ago. Then keep its
+        // message ("Claude wants to run: npm test"), which says more than this one's.
+        let prev = Sessions.read(id)
+        // Only a permission prompt can be the same dialog PermissionRequest reported; any
+        // other notification (a question, say) is its own prompt.
+        let (same, via) = type == "permission_prompt" ? samePrompt(prev) : (false, [event])
+        let message = same && via.contains("permission") ? prev?.message : payload["message"] as? String
+        record(.needsInput, message: message, workingSince: prev?.workingSince, askedVia: via,
+               note: same ? " chime=already-asked" : chime(config.input))
+    case "permission":
+        // Claude Code's PermissionRequest: a permission dialog is about to open. Fires
+        // reliably in the desktop app, where Notification's permission_prompt sometimes
+        // doesn't. Usually this prints nothing, so it decides nothing and the dialog shows.
+        // With "Allow or deny from banners" on and you away from the session, it waits for
+        // the banner's Allow or Deny instead (see Permission).
+        let prev = Sessions.read(id)
+        let (same, via) = samePrompt(prev)
+        let message = permissionMessage(payload)
+        let host = env["__CFBundleIdentifier"] ?? prev?.appBundleID
+        let mayWait = CommandLine.arguments.contains("--wait")   // see Installer.timeout(for:)
+        let token = mayWait && Permission.canAsk(config: config, host: host) ? UUID().uuidString : nil
+        record(.needsInput, message: message, workingSince: prev?.workingSince, askedVia: via, decisionToken: token,
+               note: (same ? " chime=already-asked" : chime(config.input)) + (token == nil ? "" : " asking-banner"))
+        guard let token else { break }
+        if let behavior = Permission.wait(token: token, host: host) {
+            print(Permission.output(behavior))
+            record(.working, message: nil, workingSince: prev?.workingSince, note: " decided=\(behavior) via=banner")
+        } else {
+            // No answer: take the buttons away; Claude Code shows its own dialog now.
+            record(.needsInput, message: message, workingSince: prev?.workingSince, askedVia: via, note: " banner-unanswered")
+        }
     case "tool":
         // A tool ran, so a pending permission prompt was answered and Claude is working again.
         // (Runs after every tool call, so it only writes when something changes.)
@@ -467,7 +942,8 @@ func runHook(_ event: String) -> Never {
         let turn = started.map { Date().timeIntervalSince($0) }
         let long = !config.isShortTurn(turn)
         let note = (turn.map { " turn=\(Int($0))s" } ?? "") + (long ? chime(config.done) : " chime=skipped-short-turn")
-        record(.finished, message: nil, turnSeconds: turn, note: note)
+        record(.finished, message: nil, turnSeconds: turn,
+               summary: ReplyPreview.from(payload: payload, transcript: transcript), note: note)
     case "failure":
         // The turn ended with an error (Claude Code's StopFailure hook).
         let started = Sessions.read(id)?.workingSince
@@ -516,6 +992,15 @@ enum Health {
             out.append(missing.isEmpty
                 ? .init(id: "hooks", level: .ok, title: "Claude Code hooks", detail: "All \(Installer.wanted.count) hooks are installed.")
                 : .init(id: "hooks", level: .fail, title: "Claude Code hooks", detail: "Missing: \(missing.joined(separator: ", ")). Repair adds them back."))
+        }
+
+        // Found by process, not by hook: a session that started before the hooks changed
+        // never runs the new ones, so it can't report itself.
+        let old = Installer.sessionsOnOldHooks()
+        if !old.isEmpty {
+            let n = old.count == 1 ? "1 Claude session" : "\(old.count) Claude sessions"
+            out.append(.init(id: "old-hooks", level: .warn, title: "Sessions on older hooks",
+                             detail: "\(n) started before Claude Chimes last updated its hooks, so \(old.count == 1 ? "it keeps" : "they keep") the old ones until restarted. Quit and reopen \(old.count == 1 ? "it" : "them") to get every chime."))
         }
 
         let target = (try? FileManager.default.destinationOfSymbolicLink(atPath: hookLink.path))
@@ -750,6 +1235,48 @@ final class AppModel: ObservableObject {
 
 // MARK: - Settings window
 
+/// "Add Sound…" in each sound menu: copies a file you choose into the sounds folder, so the
+/// hook can play it even if the original moves, and it shows in every list from then on.
+enum SoundImport {
+    static let tag = "__add_sound__"
+
+    @MainActor static func choose() -> URL? {
+        let panel = NSOpenPanel()
+        panel.title = "Add a Sound"
+        panel.prompt = "Add"
+        panel.allowedContentTypes = audioExts.compactMap { UTType(filenameExtension: $0) }
+        panel.allowsMultipleSelection = false
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let source = panel.url else { return nil }
+        return add(source)
+    }
+
+    /// Copies `source` in. A file already in the folder is used as it is; a name that is
+    /// taken by a different file gets " 2", " 3" and so on.
+    static func add(_ source: URL) -> URL? {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: soundsDir, withIntermediateDirectories: true)
+        if source.deletingLastPathComponent().standardizedFileURL == soundsDir.standardizedFileURL { return source }
+        let base = source.deletingPathExtension().lastPathComponent
+        let ext = source.pathExtension
+        var dest = soundsDir.appendingPathComponent(source.lastPathComponent)
+        var n = 2
+        while fm.fileExists(atPath: dest.path) {
+            if fm.contentsEqual(atPath: dest.path, andPath: source.path) { return dest }
+            dest = soundsDir.appendingPathComponent("\(base) \(n).\(ext)")
+            n += 1
+        }
+        do {
+            try fm.copyItem(at: source, to: dest)
+            EventLog.append("sound-added \(dest.lastPathComponent)")
+            return dest
+        } catch {
+            EventLog.append("warn sound-add-failed \(error.localizedDescription)")
+            return nil
+        }
+    }
+}
+
 struct SoundRow: View {
     let title: String
     let detail: String
@@ -767,13 +1294,27 @@ struct SoundRow: View {
             }
             Spacer()
             // Preview from the setter, so reloading the config from disk never plays a sound.
-            Picker(title, selection: Binding(get: { path }, set: { path = $0; model.preview($0) })) {
+            Picker(title, selection: Binding(get: { path }, set: { choice in
+                if choice == SoundImport.tag {
+                    // The menu item, not a sound: pick a file, copy it in, and use it here.
+                    // On the next turn of the run loop, not inside SwiftUI's update.
+                    let binding = $path
+                    DispatchQueue.main.async {
+                        if let added = SoundImport.choose() { binding.wrappedValue = added.path; model.preview(added.path) }
+                    }
+                } else {
+                    path = choice
+                    model.preview(choice)
+                }
+            })) {
                 if !known.contains(path) { Text(displayName(path)).tag(path) }
                 ForEach(groups, id: \.0) { group in
                     Section(group.0) {
                         ForEach(group.1, id: \.path) { Text(displayName($0.path)).tag($0.path) }
                     }
                 }
+                Divider()
+                Text("Add Sound…").tag(SoundImport.tag)
             }
             .labelsHidden()
             .frame(width: 150)
@@ -863,6 +1404,7 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("List sessions ready for your reply", isOn: $model.config.showFinished)
                 Toggle("List sessions Claude is working on", isOn: $model.config.showWorking)
+                Toggle("Show how full each session's context is", isOn: $model.config.showContext)
             }
 
             Section("Banners") {
@@ -879,6 +1421,14 @@ struct SettingsView: View {
                     Text("Until dismissed").tag(0)
                 }
                 .disabled(model.config.banner == .off)
+                Toggle("Preview Claude's reply in banners", isOn: $model.config.bannerPreview)
+                    .disabled(model.config.banner == .off)
+                Toggle("Allow or deny permission prompts from banners", isOn: $model.config.bannerActions)
+                    .disabled(model.config.banner == .off)
+                Text("When you're away from a session, its permission banner shows Allow once and Deny, and Claude waits up to a minute for your click before showing its own dialog. Switch to the session and you get the dialog at once.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("Turn this off if you share your screen and replies may be private.")
+                    .font(.caption).foregroundStyle(.secondary)
                 HStack {
                     Text("A banner names the session and what it's waiting for. Click it to open the session, or × to dismiss it.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -899,7 +1449,7 @@ struct SettingsView: View {
                         NSWorkspace.shared.open(soundsDir)
                     }
                 }
-                Text("Drop any .wav, .aiff, .mp3, .m4a or .caf file into the sounds folder to add it to the lists.")
+                Text("Choose Add Sound… in any sound menu, or drop a .wav, .aiff, .mp3, .m4a or .caf file into the sounds folder.")
                     .font(.caption).foregroundStyle(.secondary)
                 LabeledContent("Remove Claude Chimes") {
                     Button("Uninstall…", role: .destructive) { Uninstall.run() }
@@ -1034,7 +1584,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         banners.config = { [weak self] in self?.model.config ?? Config.load() }
         banners.onOpen = { [weak self] s in self?.open(s) }
-        banners.onDismiss = { [weak self] s in if s.id != "test-banner" { self?.dismiss(s, in: nil) } }
+        banners.onDismiss = { [weak self] s in if !s.id.hasPrefix("test-banner") { self?.dismiss(s, in: nil) } }
+        banners.onDecide = { s, behavior in
+            guard !s.id.hasPrefix("test-banner"), let token = s.decisionToken else { return }
+            Permission.answer(token: token, behavior: behavior)
+            EventLog.append("decide session=\(s.id.prefix(8)) \(behavior) via=banner")
+        }
         model.onTestBanner = { [weak self] in self?.showTestBanner() }
         model.peers.onRemote = { [weak self] peer, list, baseline in self?.model.setRemote(peer, list, baseline: baseline) }
         model.peers.onRemoteGone = { [weak self] peer in self?.model.removeRemote(peer) }
@@ -1044,6 +1599,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         model.onSessionsChanged = { [weak self] old, new in self?.sessionsChanged(old: old, new: new) }
         Health.relinkIfNeeded()
         Installer.upgradeIfNeeded()
+        Installer.makePrivate()
         if Welcome.shouldShow { showWelcome() }
         watchSessions()
         model.reloadSessions()
@@ -1181,7 +1737,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let i = NSMenuItem(title: s.title, action: nil, keyEquivalent: "")
         i.representedObject = s
         i.toolTip = s.remoteHost.map { "Running on \($0). Open it on that Mac. Clicking clears it here." } ?? s.cwd
-        let detail = s.remoteHost.map { "\(detail) · on \($0)" } ?? detail
+        var detail = s.remoteHost.map { "\(detail) · on \($0)" } ?? detail
+        if s.remoteHost == nil, model.config.showContext, let context = ContextUse.cachedLabel(s.transcriptPath) {
+            detail += " · \(context)"
+        }
         i.view = SessionRowView(title: s.title, subtitle: detail, symbol: symbol, iconTint: tint,
                                 onOpen: { [weak self] in self?.open(s) },
                                 onDismiss: { [weak self, weak i] in self?.dismiss(s, in: i?.menu) })
@@ -1207,7 +1766,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if wanted { banners.show(s) } else { banners.remove(id: s.id, animated: true) }
         }
         let alive = Set(new.map(\.id))
-        for id in banners.visibleIDs where !alive.contains(id) && id != "test-banner" { banners.remove(id: id, animated: true) }
+        for id in banners.visibleIDs where !alive.contains(id) && !id.hasPrefix("test-banner") { banners.remove(id: id, animated: true) }
     }
 
     /// This Mac's hook chimes for its own sessions. Sessions from another Mac chime here, by this Mac's settings.
@@ -1235,10 +1794,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// A sample banner for Settings → Banners → Show Test Banner.
+    /// Two sample banners for Settings → Banners → Show Test Banner: one of each kind, with
+    /// every line filled in, so the setting's effect (and the stacking) can be seen at once.
     func showTestBanner() {
-        banners.show(SessionState(id: "test-banner", status: .needsInput, title: "Test banner from Claude Chimes",
-                                  cwd: "", message: "This is what a banner looks like", appBundleID: nil, updatedAt: Date()))
+        var done = SessionState(id: "test-banner-finished", status: .finished, title: "Sample: write the release notes",
+                                cwd: "/sample/api-server", message: nil, appBundleID: nil, updatedAt: Date())
+        done.turnSeconds = 252
+        done.reply = "The release notes are written in CHANGELOG.md, with the permission hook first and the Homebrew cask last. All tests pass. Nothing is pushed yet."
+        done.replyIsRecap = true
+        done.ask = "Push the branch and open a pull request?"
+        done.receipt = "Edited 6 files · tests passed · 2 unpushed commits"
+        banners.show(done)
+        var input = SessionState(id: "test-banner-input", status: .needsInput, title: "Sample: fix the login redirect",
+                                 cwd: "/sample/api-server", message: "Claude wants to run: npm test -- --grep \"login redirect\"",
+                                 appBundleID: nil, updatedAt: Date())
+        input.askedVia = ["permission"]
+        // Buttons only when the setting is on; on a sample they just close it.
+        if model.config.bannerActions { input.decisionToken = "sample" }
+        banners.show(input)
     }
 
     func dismiss(_ s: SessionState, in menu: NSMenu?) {
@@ -1425,6 +1998,53 @@ if args.contains("--uninstall") {
     catch { FileHandle.standardError.write(Data("Uninstall failed: \(error.localizedDescription)\n".utf8)); exit(1) }
     exit(0)
 }
+// `--check-banner-clicks` builds sample banners and checks where clicks land: anywhere on the
+// card but its buttons must reach the card (which opens the session), never the text.
+if args.contains("--check-banner-clicks") {
+    MainActor.assumeIsolated {
+        _ = NSApplication.shared
+        var s = SessionState(id: "c", status: .finished, title: "Sample", cwd: "/x/api", message: nil, appBundleID: nil, updatedAt: Date())
+        s.reply = "The banner opens the session when you click it. Nothing else changed."
+        s.ask = "Push the branch?"
+        s.receipt = "Edited 2 files · tests passed"
+        let banner = BannerView(session: s, onOpen: {}, onDismiss: {})
+        var p = s; p.status = .needsInput; p.message = "Claude wants to run: npm test"; p.askedVia = ["permission"]; p.decisionToken = "t"
+        let permission = BannerView(session: p, onOpen: {}, onDismiss: {})
+        var failures: [String] = []
+        for (name, view) in [("finished", banner), ("permission", permission)] {
+            let host = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            host.addSubview(view)
+            for field in view.subviews.compactMap({ $0 as? NSTextField }) where field.isSelectable || field.isEditable {
+                failures.append("\(name): selectable text \"\(field.stringValue.prefix(30))\"")
+            }
+            for sub in view.subviews where !(sub is NSButton) && !(sub is NSVisualEffectView) {
+                let point = NSPoint(x: sub.frame.midX, y: sub.frame.midY)
+                if view.hitTest(point) !== view { failures.append("\(name): a click on \(type(of: sub)) misses the card") }
+            }
+            for button in view.subviews.compactMap({ $0 as? NSButton }) {
+                let point = NSPoint(x: button.frame.midX, y: button.frame.midY)
+                if view.hitTest(point) !== button { failures.append("\(name): \(button.title.isEmpty ? "close" : button.title) can't be clicked") }
+            }
+        }
+        if failures.isEmpty { print("ok") } else { print(failures.joined(separator: "\n")); exit(1) }
+    }
+    exit(0)
+}
+// `--context <transcript.jsonl>` prints what a session row would say about its context.
+if let i = args.firstIndex(of: "--context") {
+    print(i + 1 < args.count ? (ContextUse.label(args[i + 1]) ?? "unknown") : "unknown")
+    exit(0)
+}
+// `--add-sound <file>` copies a sound in, as Add Sound… does, and prints where it landed.
+if let i = args.firstIndex(of: "--add-sound") {
+    guard i + 1 < args.count, audioExts.contains(URL(fileURLWithPath: args[i + 1]).pathExtension.lowercased()),
+          let added = SoundImport.add(URL(fileURLWithPath: args[i + 1])) else {
+        FileHandle.standardError.write(Data("Give an audio file: .wav, .aiff, .mp3, .m4a or .caf.\n".utf8))
+        exit(1)
+    }
+    print(added.path)
+    exit(0)
+}
 if let i = args.firstIndex(of: "--dismiss") {
     let wanted = i + 1 < args.count ? args[i + 1] : ""
     let matches = Sessions.all().filter { !wanted.isEmpty && $0.id.hasPrefix(wanted) }
@@ -1559,15 +2179,31 @@ if let i = args.firstIndex(of: "--snapshot-banner"), i + 1 < args.count {
         _ = NSApplication.shared
         let dark = args.contains("--dark"), finished = args.contains("--finished")
         var s = SessionState(id: "demo", status: finished ? .finished : .needsInput,
-                             title: finished ? "Write the release notes" : "Fix the login redirect", cwd: "",
-                             message: finished ? nil : "Claude needs your permission to use Bash", appBundleID: nil, updatedAt: Date())
+                             title: finished ? "Write the release notes" : "Fix the login redirect", cwd: "/Users/someone/api-server",
+                             message: finished ? nil : "Claude wants to run: npm test -- --grep \"login redirect\"", appBundleID: nil, updatedAt: Date())
         if args.contains("--remote") { s.remotePeer = "demo"; s.remoteHost = "Mac mini" }
+        if finished {
+            s.turnSeconds = 252
+            s.reply = "The release notes for 1.8.0 are written in CHANGELOG.md, with the permission hook first and the Homebrew cask last. All 75 tests pass. Nothing is pushed yet."
+            s.replyIsRecap = true
+            if !args.contains("--no-ask") { s.ask = "Push the branch and open a pull request?" }
+        }
+        if finished { s.receipt = "Edited 6 files · tests passed · 2 unpushed commits" }
+        if args.contains("--permission") { s.askedVia = ["permission"]; s.decisionToken = "demo" }
+        if args.contains("--plain") { s.cwd = ""; s.reply = nil; s.receipt = nil }
         let pad: CGFloat = 20
-        let canvas = NSView(frame: NSRect(x: 0, y: 0, width: BannerView.size.width + 2 * pad, height: BannerView.size.height + 2 * pad))
+        var banner = BannerView(session: s, onOpen: {}, onDismiss: {})
+        if args.contains("--digest") {
+            var a = s; a.id = "a"; a.title = "Fix the login redirect"; a.status = .needsInput; a.ask = nil
+            a.message = "Claude wants to run: npm test"; a.askedVia = ["permission"]
+            var b = s; b.id = "b"; b.title = "Write the release notes"; b.status = .finished; b.ask = nil
+            var d = s; d.id = "d"; d.title = "Refactor the settings parser"; d.status = .finished; d.ask = nil
+            banner = BannerView(card: BannerCard(digest: [b, a, d]), onOpen: {}, onDismiss: {})
+        }
+        let canvas = NSView(frame: NSRect(x: 0, y: 0, width: banner.frame.width + 2 * pad, height: banner.frame.height + 2 * pad))
         canvas.wantsLayer = true
         canvas.layer?.backgroundColor = (dark ? NSColor(calibratedRed: 0.13, green: 0.15, blue: 0.2, alpha: 1)
                                               : NSColor(calibratedRed: 0.78, green: 0.83, blue: 0.9, alpha: 1)).cgColor
-        let banner = BannerView(session: s, onOpen: {}, onDismiss: {})
         banner.frame.origin = NSPoint(x: pad, y: pad)
         // Offscreen rendering can't sample the desktop for the blur, so stand in with the material's tint.
         banner.wantsLayer = true

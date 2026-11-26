@@ -17,6 +17,9 @@ enum Installer {
         ("UserPromptSubmit", "prompt", true), ("PostToolUse", "tool", true), ("SessionEnd", "end", true),
         ("StopFailure", "failure", false),   // 1.6: a turn ended with an error
         ("PreCompact", "compact", true),     // 1.6: Claude is about to compact the conversation
+        // 1.8: Notification's permission_prompt is unreliable in the Claude desktop app;
+        // PermissionRequest fires for every permission dialog. Both may fire; the hook chimes once.
+        ("PermissionRequest", "permission", false),
     ]
 
     /// Earlier versions installed fewer hooks. If some of ours are present but not all, the user
@@ -57,8 +60,18 @@ enum Installer {
         (settings["hooks"]?[event]?.array ?? []).flatMap { ($0["hooks"]?.array ?? []).compactMap { $0["command"]?.string } }
     }
 
+    /// Seconds Claude Code gives a hook. The permission hook can wait for an answer from the
+    /// banner (up to `Permission.wait`), so it gets more; the rest return in milliseconds.
+    static func timeout(for arg: String) -> String { arg == "permission" ? "75" : "5" }
+
     static func hooksInstalled(_ settings: JSON) -> Bool {
-        wanted.allSatisfy { ev, arg, _ in commands(in: settings, event: ev).contains { $0.contains("chimes/chime-hook \(arg)") } }
+        wanted.allSatisfy { ev, arg, _ in
+            (settings["hooks"]?[ev]?.array ?? []).flatMap { $0["hooks"]?.array ?? [] }.contains { hook in
+                (hook["command"]?.string ?? "").contains("chimes/chime-hook \(arg)")
+                    // An older install's hook with a different timeout counts as out of date.
+                    && { if case let .number(n)? = hook["timeout"] { return n == timeout(for: arg) }; return false }()
+            }
+        }
     }
 
     static var isSetUp: Bool {
@@ -83,8 +96,11 @@ enum Installer {
         if install {
             for (event, arg, background) in wanted {
                 var hook: [(String, JSON)] = [("type", .string("command")),
-                                              ("command", .string("~/.claude/chimes/chime-hook \(arg)")),
-                                              ("timeout", .number("5"))]
+                                              // The permission hook may wait up to a minute, so its entry
+                                              // carries --wait: a session started on an older entry (5 s
+                                              // timeout) runs it without, and then it never waits.
+                                              ("command", .string("~/.claude/chimes/chime-hook \(arg)" + (arg == "permission" ? " --wait" : ""))),
+                                              ("timeout", .number(timeout(for: arg)))]
                 if background { hook.append(("async", .bool(true))) }
                 let group = JSON.object([("hooks", .array([.object(hook)]))])
                 if let i = events.firstIndex(where: { $0.0 == event }), let groups = events[i].1.array {
@@ -104,8 +120,54 @@ enum Installer {
         if fm.fileExists(atPath: settingsURL.path) {
             let stamp = DateFormatter.backupStamp.string(from: Date())
             try? fm.copyItem(at: settingsURL, to: settingsURL.appendingPathExtension("bak-chimes-\(stamp)"))
+            pruneBackups(keep: 5)
         }
         try Data((settings.serialized() + "\n").utf8).write(to: settingsURL, options: .atomic)
+    }
+
+    /// Keeps the newest `keep` settings backups this app made, so repairs and upgrades
+    /// don't leave a pile of them beside settings.json. Backups made by anything else are left alone.
+    static func pruneBackups(keep: Int) {
+        let dir = settingsURL.deletingLastPathComponent()
+        let prefix = settingsURL.lastPathComponent + ".bak-chimes-"
+        let names = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+            .filter { $0.hasPrefix(prefix) }
+            .sorted(by: >)   // the stamp sorts by time
+        for name in names.dropFirst(keep) {
+            try? FileManager.default.removeItem(at: dir.appendingPathComponent(name))
+        }
+    }
+
+    /// Makes ~/.claude/chimes, its sessions and the session files this account's alone.
+    /// New files are written that way; this brings older installs' files in line too.
+    static func makePrivate() {
+        let fm = FileManager.default
+        for dir in [chimesDir, sessionsDir] where fm.fileExists(atPath: dir.path) {
+            try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+        }
+        for name in (try? fm.contentsOfDirectory(atPath: sessionsDir.path)) ?? [] where name.hasSuffix(".json") {
+            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: sessionsDir.appendingPathComponent(name).path)
+        }
+    }
+
+    /// When Claude Chimes last changed its hooks. Claude Code reads hooks when a session
+    /// starts, so any session older than this still runs the hooks it started with.
+    static let hooksWrittenURL = chimesDir.appendingPathComponent("hooks-written")
+
+    static func markHooksWritten() {
+        try? FileManager.default.createDirectory(at: chimesDir, withIntermediateDirectories: true)
+        try? String(Date().timeIntervalSince1970).write(to: hooksWrittenURL, atomically: true, encoding: .utf8)
+    }
+
+    static var hooksWrittenAt: Double? {
+        (try? String(contentsOf: hooksWrittenURL, encoding: .utf8)).flatMap { Double($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+    }
+
+    /// Running Claude Code sessions that started before the hooks were last written.
+    static func sessionsOnOldHooks() -> [Int32] {
+        guard let written = hooksWrittenAt else { return [] }
+        return ProcessCheck.claudeProcesses().filter { $0.value < written - 1 && ProcessCheck.isSession($0.key) }
+            .map(\.key).sorted()
     }
 
     // MARK: Files
@@ -142,10 +204,14 @@ enum Installer {
         case .failure(let e): throw InstallError(message: e.message + ". Fix the file by hand, then try again.")
         }
         let copied = seedSounds()
+        makePrivate()
         if !FileManager.default.fileExists(atPath: configURL.path) { Config().save() }
         try link()
         let edited = editedHooks(settings, install: true)
-        if edited != settings { try writeSettings(edited) }   // no rewrite (or backup) when already set up
+        if edited != settings {   // no rewrite (or backup) when already set up
+            try writeSettings(edited)
+            markHooksWritten()
+        }
         EventLog.append("setup hooks-written sounds-copied=\(copied) link=\(appBinary?.path ?? "-")")
     }
 

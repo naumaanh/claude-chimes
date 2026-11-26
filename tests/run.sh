@@ -44,13 +44,17 @@ check "top-level key order kept" '[ "$(python3 -c "import json,sys; print(list(j
 check "number spelling kept (1.0e3)" 'grep -q "\"ratio\": 1.0e3" "$SETTINGS"'
 check "unrelated hooks kept" 'grep -q "my-guard" "$SETTINGS" && grep -q "echo other-stop" "$SETTINGS"'
 check "1.0 chime.sh hook replaced" '! grep -q "chimes/chime.sh" "$SETTINGS"'
-for ev in notification stop prompt tool end failure compact; do
-  check "hook installed: $ev" 'grep -q "chimes/chime-hook '"$ev"'\"" "$SETTINGS"'
+for ev in notification stop prompt tool end failure compact permission; do
+  check "hook installed: $ev" 'grep -Eq "chimes/chime-hook '"$ev"'( --wait)?\"" "$SETTINGS"'
 done
 check "background hooks are async" '[ "$(grep -c "\"async\": true" "$SETTINGS")" = 4 ]'
 check "chimes copied to ~/.claude/chimes/sounds" '[ "$(ls "$HOME/.claude/chimes/sounds" | wc -l | tr -d " ")" = 7 ]'
 cp "$SETTINGS" "$WORK/after-setup.json"
 lim "$BIN" --setup </dev/null >/dev/null
+mkdir -p "$HOME/.claude/chimes/sessions"; echo '{}' > "$HOME/.claude/chimes/sessions/old.json"; chmod 644 "$HOME/.claude/chimes/sessions/old.json"; chmod 755 "$HOME/.claude/chimes/sessions" "$HOME/.claude/chimes"
+lim "$BIN" --setup </dev/null >/dev/null
+check "setup makes an older install's session files private" '[ "$(stat -f %Lp "$HOME/.claude/chimes/sessions/old.json")" = 600 ] && [ "$(stat -f %Lp "$HOME/.claude/chimes")" = 700 ]'
+rm -f "$HOME/.claude/chimes/sessions/old.json"
 check "running setup again changes nothing" 'cmp -s "$SETTINGS" "$WORK/after-setup.json"'
 check "doctor passes" 'lim "$HOOK" --doctor </dev/null >/dev/null'
 
@@ -62,6 +66,19 @@ hook s1 prompt CLAUDE_CODE_ENTRYPOINT=cli
 check "sending a message marks it working" '[ "$(status_of s1)" = working ]'
 hook s1 notification CLAUDE_CODE_ENTRYPOINT=cli
 check "permission prompt marks needs-input" '[ "$(status_of s1)" = needs-input ]'
+echo '{"session_id":"p1","cwd":"/tmp/p1","tool_name":"Bash","tool_input":{"command":"npm test"}}' | lim "$HOOK" permission > "$WORK/perm.out"
+check "PermissionRequest marks needs-input" '[ "$(status_of p1)" = needs-input ]'
+check "PermissionRequest names the command" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"message\"]==\"Claude wants to run: npm test\"" "$SESSIONS/p1.json"'
+check "PermissionRequest prints nothing, so it decides nothing" '[ ! -s "$WORK/perm.out" ]'
+check "PermissionRequest chimes" 'lastlog | grep -q "permission session=p1.*chime=played"'
+hook p1 notification
+check "a Notification for the same prompt doesn't chime again" 'lastlog | grep -q "notification session=p1.*chime=already-asked"'
+check "it keeps the more specific permission message" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"message\"]==\"Claude wants to run: npm test\"" "$SESSIONS/p1.json"'
+echo '{"session_id":"p1","cwd":"/tmp/p1","tool_name":"Bash","tool_input":{"command":"git clean -fd"}}' | lim "$HOOK" permission
+check "a new prompt right after a denied one still chimes" 'lastlog | grep -q "permission session=p1.*chime=played"'
+echo '{"session_id":"p1","cwd":"/tmp/p1","notification_type":"elicitation_dialog","message":"Claude has a question"}' | lim "$HOOK" notification
+check "a question right after a permission prompt still chimes" 'lastlog | grep -q "notification session=p1.*chime=played"'
+check "session files are readable by this account only" '[ "$(stat -f %Lp "$SESSIONS/p1.json")" = 600 ] && [ "$(stat -f %Lp "$SESSIONS")" = 700 ] && [ "$(stat -f %Lp "$HOME/.claude/chimes")" = 700 ]'
 hook s1 tool
 check "a tool run returns it to working" '[ "$(status_of s1)" = working ]'
 hook s1 stop CLAUDE_CODE_ENTRYPOINT=cli
@@ -152,6 +169,116 @@ check "Other Macs setting is read from config" 'lim "$BIN" --doctor </dev/null |
 sed -i '' '/^otherMacs=/d' "$HOME/.claude/chimes/config"
 check "the hook never creates peers.json" '[ ! -e "$HOME/.claude/chimes/peers.json" ]'
 
+section "Sessions on older hooks"
+export CLAUDE_CHIMES_PROCESS_NAME=chimes-stand-in
+# A real program with its own name: a copied system binary is killed by code signing,
+# and a symlink reports the name of what it points at.
+printf '#include <unistd.h>\nint main(void) { sleep(60); return 0; }\n' | cc -x c - -o "$WORK/chimes-stand-in"
+"$WORK/chimes-stand-in" & OLD=$!
+"$WORK/chimes-stand-in" -p "summarize this" & ONESHOT=$!   # a one-shot run, not a conversation
+sleep 1.5
+lim "$BIN" --uninstall </dev/null >/dev/null; lim "$BIN" --setup </dev/null >/dev/null
+check "setup records when it wrote the hooks" '[ -s "$HOME/.claude/chimes/hooks-written" ]'
+check "a session started before that is flagged, a one-shot -p run is not" 'lim "$HOOK" --doctor </dev/null | grep -q "1 Claude session started before"'
+kill $OLD $ONESHOT 2>/dev/null; wait $OLD $ONESHOT 2>/dev/null
+"$WORK/chimes-stand-in" & NEW=$!
+check "a session started after it is not" '! lim "$HOOK" --doctor </dev/null | grep -q "started before Claude Chimes"'
+kill $NEW 2>/dev/null; wait $NEW 2>/dev/null
+unset CLAUDE_CHIMES_PROCESS_NAME
+
+section "Context use"
+T="$WORK/t.jsonl"
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"hi"}}' \
+  '{"type":"assistant","message":{"usage":{"input_tokens":5,"cache_read_input_tokens":120000,"cache_creation_input_tokens":3400}}}' \
+  '{"type":"assistant","message":{"usage":{"input_tokens":2,"cache_read_input_tokens":181000,"cache_creation_input_tokens":500}}}' \
+  '{"type":"user","message":{"role":"user","content":"thanks"}}' > "$T"
+check "context comes from the last reply, cache included" '[ "$(lim "$BIN" --context "$T" </dev/null)" = "182k context" ]'
+check "a transcript with no replies says unknown" '[ "$(lim "$BIN" --context "$SETTINGS" </dev/null)" = unknown ]'
+
+section "Reply previews for banners"
+R="$WORK/r.jsonl"
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"go"}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]}}' \
+  '{"type":"assistant","message":{"content":[{"type":"text","text":"## Done\n\n**Fixed** the `login` redirect. See [the PR](https://x.test/1).\n```\ncode here\n```"}]}}' > "$R"
+echo "{\"session_id\":\"r1\",\"cwd\":\"/tmp/r1\",\"transcript_path\":\"$R\"}" | lim "$HOOK" stop
+check "a finished turn keeps the start of the reply, as plain text" 'python3 -c "import json,sys; r=json.load(open(sys.argv[1]))[\"reply\"]; assert r==\"Done Fixed the login redirect. See the PR.\", r" "$SESSIONS/r1.json"'
+echo '{"session_id":"r2","cwd":"/tmp/r2","last_assistant_message":"All 40 tests pass."}' | lim "$HOOK" stop
+check "the reply in the Stop payload is used when there is one" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"reply\"]==\"All 40 tests pass.\"" "$SESSIONS/r2.json"'
+check "the reply is never sent to other Macs" '! grep -q "\"reply\"" "$ROOT/app/Sources/Peers.swift"'
+rm -f "$SESSIONS"/r1.json "$SESSIONS"/r2.json
+W="$WORK/w.jsonl"
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"first task"}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__ccd_turn__wrap_up","input":{"recap":"Old turn recap."}}]}}' \
+  '{"type":"user","message":{"role":"user","content":"fix the banner"}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]}}' \
+  '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"ok"}]}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__ccd_turn__wrap_up","input":{"recap":"The banner shows the **recap** now. Nothing is pushed.","ask":"Push the branch?"}}]}}' \
+  '{"type":"assistant","message":{"content":[{"type":"text","text":"Long reply that should not be shown."}]}}' > "$W"
+echo "{\"session_id\":\"w1\",\"cwd\":\"/tmp/w1\",\"transcript_path\":\"$W\"}" | lim "$HOOK" stop
+check "the turn's own recap is the summary" 'python3 -c "import json,sys; s=json.load(open(sys.argv[1])); assert s[\"reply\"]==\"The banner shows the recap now. Nothing is pushed.\" and s[\"replyIsRecap\"], s" "$SESSIONS/w1.json"'
+check "the recap's question is kept apart" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"ask\"]==\"Push the branch?\"" "$SESSIONS/w1.json"'
+head -2 "$W" > "$WORK/w2.jsonl"; printf '%s\n' '{"type":"user","message":{"role":"user","content":"next"}}' \
+  '{"type":"assistant","message":{"content":[{"type":"text","text":"Renamed the file.\n\nShould I commit it?"}]}}' >> "$WORK/w2.jsonl"
+echo "{\"session_id\":\"w2\",\"cwd\":\"/tmp/w2\",\"transcript_path\":\"$WORK/w2.jsonl\"}" | lim "$HOOK" stop
+check "an earlier turn's recap is never used" 'python3 -c "import json,sys; s=json.load(open(sys.argv[1])); assert s[\"reply\"]==\"Renamed the file.\" and not s.get(\"replyIsRecap\"), s" "$SESSIONS/w2.json"'
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"go"}}' '{"type":"assistant","message":{"content":[{"type":"text","text":"Built it.\n\nShould I **push** `main`?"}]}}' > "$WORK/w3.jsonl"
+echo "{\"session_id\":\"w3\",\"cwd\":\"/tmp/w3\",\"transcript_path\":\"$WORK/w3.jsonl\"}" | lim "$HOOK" stop
+check "a question with markdown in it shows once, not twice" 'python3 -c "import json,sys; s=json.load(open(sys.argv[1])); assert s[\"reply\"]==\"Built it.\" and s[\"ask\"]==\"Should I push main?\", s" "$SESSIONS/w3.json"'
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"go"}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__ccd_turn__wrap_up","input":{"recap":"Recap before a notice."}}]}}' \
+  '{"type":"user","message":{"role":"user","content":"<task-notification>\nThe build finished.\n</task-notification>"}}' \
+  '{"type":"assistant","message":{"content":[{"type":"text","text":"Noted."}]}}' > "$WORK/w4.jsonl"
+echo "{\"session_id\":\"w4\",\"cwd\":\"/tmp/w4\",\"transcript_path\":\"$WORK/w4.jsonl\"}" | lim "$HOOK" stop
+check "a notice the app injects doesn't hide the turn's recap" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"reply\"]==\"Recap before a notice.\"" "$SESSIONS/w4.json"'
+check "without a recap, a closing question is pulled out" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"ask\"]==\"Should I commit it?\"" "$SESSIONS/w2.json"'
+rm -f "$SESSIONS"/w1.json "$SESSIONS"/w2.json "$SESSIONS"/w3.json "$SESSIONS"/w4.json
+
+section "Banner clicks"
+check "a click anywhere on a banner but its buttons opens the session" 'lim "$BIN" --check-banner-clicks </dev/null | grep -qx ok'
+
+section "Work receipts"
+K="$WORK/k.jsonl"
+cat > "$K" <<'JSONL'
+{"type":"user","message":{"role":"user","content":"ship it"}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/x/a.swift"}},{"type":"tool_use","id":"e2","name":"Write","input":{"file_path":"/x/b.swift"}},{"type":"tool_use","id":"e3","name":"Edit","input":{"file_path":"/x/a.swift"}},{"type":"tool_use","id":"e4","name":"Edit","input":{"file_path":"/x/c.swift"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"e1","content":"ok"},{"type":"tool_result","tool_use_id":"e2","content":"ok"},{"type":"tool_result","tool_use_id":"e3","content":"ok"},{"type":"tool_result","tool_use_id":"e4","content":"no match","is_error":true}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"python3 - <<'EOF'\nprint('git commit and git push and tests/run.sh are only text here')\nEOF"}},{"type":"tool_use","id":"b2","name":"Bash","input":{"command":"cd app && tests/run.sh > log 2>&1"}},{"type":"tool_use","id":"b3","name":"Bash","input":{"command":"git add -A && git commit -m \"fix: git push later\""}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"b1","content":"ok"},{"type":"tool_result","tool_use_id":"b2","content":"72 passed"},{"type":"tool_result","tool_use_id":"b3","content":"ok"}]}}
+JSONL
+echo "{\"session_id\":\"k1\",\"cwd\":\"/tmp/k1\",\"transcript_path\":\"$K\"}" | lim "$HOOK" stop
+check "the receipt counts what the turn really did" 'python3 -c "import json,sys; r=json.load(open(sys.argv[1]))[\"receipt\"]; assert r==\"Edited 2 files · tests passed · 1 unpushed commit\", r" "$SESSIONS/k1.json"'
+rm -f "$SESSIONS/k1.json"
+
+section "Allow or deny from the banner"
+printf 'bannerActions=1\n' >> "$HOME/.claude/chimes/config"
+perm() { echo '{"session_id":"q1","cwd":"/tmp/q1","tool_name":"Bash","tool_input":{"command":"npm test"}}' | env CLAUDE_CHIMES_APP_RUNNING=1 CLAUDE_CHIMES_PERMISSION_WAIT="$1" perl -e 'alarm 20; exec @ARGV' "$HOOK" permission --wait; }
+answer() { for _ in $(seq 1 40); do t=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('decisionToken') or '')" "$SESSIONS/q1.json" 2>/dev/null); [ -n "$t" ] && { mkdir -p "$HOME/.claude/chimes/decisions"; printf "$1" > "$HOME/.claude/chimes/decisions/$t"; return; }; sleep 0.1; done; }
+perm 10 > "$WORK/allow.out" & PID=$!; answer allow; wait $PID
+check "Allow on the banner allows this one request" 'python3 -c "import json,sys; d=json.load(open(sys.argv[1]))[\"hookSpecificOutput\"]; assert d[\"hookEventName\"]==\"PermissionRequest\" and d[\"decision\"]==dict(behavior=\"allow\"), d" "$WORK/allow.out"'
+check "after an answer the session is working again" '[ "$(status_of q1)" = working ]'
+perm 10 > "$WORK/deny.out" & PID=$!; answer deny; wait $PID
+check "Deny on the banner denies it" 'grep -q "\"behavior\":\"deny\"" "$WORK/deny.out"'
+perm 1 > "$WORK/none.out"
+check "no answer: the hook prints nothing, so Claude shows its own dialog" '[ ! -s "$WORK/none.out" ] && [ "$(status_of q1)" = needs-input ]'
+check "and the buttons are gone" 'python3 -c "import json,sys; assert not json.load(open(sys.argv[1])).get(\"decisionToken\")" "$SESSIONS/q1.json"'
+echo '{"session_id":"q2","cwd":"/tmp/q2","tool_name":"Bash","tool_input":{"command":"ls"}}' | env CLAUDE_CHIMES_APP_RUNNING=0 perl -e 'alarm 20; exec @ARGV' "$HOOK" permission > "$WORK/noapp.out"
+echo '{"session_id":"q3","cwd":"/tmp/q3","tool_name":"Bash","tool_input":{"command":"ls"}}' | env CLAUDE_CHIMES_APP_RUNNING=1 perl -e 'alarm 20; exec @ARGV' "$HOOK" permission > "$WORK/old.out"
+check "a session on the older hook entry (no --wait) never waits" '[ ! -s "$WORK/old.out" ] && ! grep "session=q3" "$HOME/.claude/chimes/events.log" | grep -q asking-banner'
+check "the permission hook gets a longer timeout" 'python3 -c "import json,sys; h=[x for g in json.load(open(sys.argv[1]))[\"hooks\"][\"PermissionRequest\"] for x in g[\"hooks\"] if \"chime-hook\" in x[\"command\"]][0]; assert h[\"timeout\"]==75 and h[\"command\"].endswith(\"permission --wait\"), h" "$SETTINGS"'
+check "without the menu bar app it never waits" '[ ! -s "$WORK/noapp.out" ] && ! grep -q "asking-banner" <(grep "session=q2" "$HOME/.claude/chimes/events.log")'
+sed -i '' '/^bannerActions=/d' "$HOME/.claude/chimes/config"
+rm -f "$SESSIONS"/q1.json "$SESSIONS"/q2.json "$SESSIONS"/q3.json
+
+section "Adding your own sounds"
+mkdir -p "$WORK/mine" "$WORK/other"
+cp "$HOME/.claude/chimes/sounds/input-nudge.wav" "$WORK/mine/Ding.wav"
+ADDED="$(lim "$BIN" --add-sound "$WORK/mine/Ding.wav" </dev/null)"
+check "a sound is copied into the sounds folder" '[ "$ADDED" = "$HOME/.claude/chimes/sounds/Ding.wav" ] && [ -f "$ADDED" ]'
+check "adding the same file again reuses it" '[ "$(lim "$BIN" --add-sound "$WORK/mine/Ding.wav" </dev/null)" = "$ADDED" ]'
+cp "$HOME/.claude/chimes/sounds/done-spark.wav" "$WORK/other/Ding.wav"
+check "a different file with a taken name gets a number" '[ "$(lim "$BIN" --add-sound "$WORK/other/Ding.wav" </dev/null)" = "$HOME/.claude/chimes/sounds/Ding 2.wav" ]'
+check "a file that isn't audio is refused" '! lim "$BIN" --add-sound "$SETTINGS" </dev/null 2>/dev/null'
+
 section "Uninstall"
 cp "$ROOT/tests/fixtures/settings.json" "$SETTINGS"
 lim "$BIN" --setup </dev/null >/dev/null
@@ -161,6 +288,11 @@ check "keeps sounds without --delete-data" '[ -d "$HOME/.claude/chimes/sounds" ]
 lim "$BIN" --setup </dev/null >/dev/null; lim "$BIN" --uninstall --delete-data </dev/null >/dev/null
 check "--delete-data removes ~/.claude/chimes" '[ ! -e "$HOME/.claude/chimes" ]'
 check "backups were written" 'ls "$HOME/.claude" | grep -q "settings.json.bak-chimes-"'
+for n in 1 2 3 4 5 6 7 8; do echo '{}' > "$HOME/.claude/settings.json.bak-chimes-2020010100000$n"; done
+echo '{}' > "$HOME/.claude/settings.json.bak-other-tool"
+lim "$BIN" --setup </dev/null >/dev/null
+check "only the five newest of its own backups are kept" '[ "$(ls "$HOME/.claude" | grep -c "settings.json.bak-chimes-")" = 5 ] && ! ls "$HOME/.claude" | grep -q "bak-chimes-20200101000001"'
+check "a backup from another tool is left alone" '[ -f "$HOME/.claude/settings.json.bak-other-tool" ]'
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]
