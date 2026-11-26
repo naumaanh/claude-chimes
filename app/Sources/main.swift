@@ -13,6 +13,7 @@
 import AppKit
 import ServiceManagement
 import SwiftUI
+import UniformTypeIdentifiers
 
 let homeDir = URL(fileURLWithPath: ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory())
 let chimesDir = homeDir.appendingPathComponent(".claude/chimes")
@@ -403,6 +404,19 @@ func playDetached(_ path: String, volume: Double) {
     p.waitUntilExit()
 }
 
+/// "Claude wants to run: npm test", from a PermissionRequest payload, in the words
+/// Claude Code's own notification uses.
+func permissionMessage(_ payload: [String: Any]) -> String {
+    let tool = payload["tool_name"] as? String ?? "a tool"
+    let input = payload["tool_input"] as? [String: Any] ?? [:]
+    let detail = (input["command"] as? String) ?? (input["file_path"] as? String)
+        ?? (input["url"] as? String) ?? (input["pattern"] as? String)
+    guard let detail, !detail.isEmpty else { return "Claude needs your permission to use \(tool)" }
+    let line = detail.split(separator: "\n").first.map(String.init) ?? detail
+    let short = line.count > 80 ? String(line.prefix(79)) + "…" : line
+    return tool == "Bash" ? "Claude wants to run: \(short)" : "Claude wants to use \(tool): \(short)"
+}
+
 func runHook(_ event: String) -> Never {
     let payload = (try? JSONSerialization.jsonObject(with: FileHandle.standardInput.readDataToEndOfFile())) as? [String: Any] ?? [:]
     let env = ProcessInfo.processInfo.environment
@@ -443,6 +457,13 @@ func runHook(_ event: String) -> Never {
         return " chime=played"
     }
 
+    /// True when this session started waiting on you in the last few seconds, which means
+    /// the other of Notification and PermissionRequest already chimed for the same prompt.
+    func justAsked(_ prev: SessionState?) -> Bool {
+        guard let prev, prev.status == .needsInput else { return false }
+        return Date().timeIntervalSince(prev.updatedAt) < 8
+    }
+
     switch event {
     case "prompt":
         // You sent a message: the session is working, and the turn's clock starts.
@@ -454,8 +475,18 @@ func runHook(_ event: String) -> Never {
             EventLog.append("notification session=\(short) type=\(type) skipped")
             exit(0)
         }
-        record(.needsInput, message: payload["message"] as? String,
-               workingSince: Sessions.read(id)?.workingSince, note: chime(config.input))
+        // PermissionRequest may have chimed for this same prompt a moment ago: take the
+        // message, which reads better, but don't chime twice.
+        let prev = Sessions.read(id)
+        record(.needsInput, message: payload["message"] as? String, workingSince: prev?.workingSince,
+               note: justAsked(prev) ? " chime=already-asked" : chime(config.input))
+    case "permission":
+        // Claude Code's PermissionRequest: a permission dialog is open. Fires reliably in the
+        // desktop app, where Notification's permission_prompt sometimes doesn't. This hook
+        // prints nothing, so it makes no decision and the dialog shows as usual.
+        let prev = Sessions.read(id)
+        record(.needsInput, message: permissionMessage(payload), workingSince: prev?.workingSince,
+               note: justAsked(prev) ? " chime=already-asked" : chime(config.input))
     case "tool":
         // A tool ran, so a pending permission prompt was answered and Claude is working again.
         // (Runs after every tool call, so it only writes when something changes.)
@@ -750,6 +781,48 @@ final class AppModel: ObservableObject {
 
 // MARK: - Settings window
 
+/// "Add Sound…" in each sound menu: copies a file you choose into the sounds folder, so the
+/// hook can play it even if the original moves, and it shows in every list from then on.
+enum SoundImport {
+    static let tag = "__add_sound__"
+
+    @MainActor static func choose() -> URL? {
+        let panel = NSOpenPanel()
+        panel.title = "Add a Sound"
+        panel.prompt = "Add"
+        panel.allowedContentTypes = audioExts.compactMap { UTType(filenameExtension: $0) }
+        panel.allowsMultipleSelection = false
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let source = panel.url else { return nil }
+        return add(source)
+    }
+
+    /// Copies `source` in. A file already in the folder is used as it is; a name that is
+    /// taken by a different file gets " 2", " 3" and so on.
+    static func add(_ source: URL) -> URL? {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: soundsDir, withIntermediateDirectories: true)
+        if source.deletingLastPathComponent().standardizedFileURL == soundsDir.standardizedFileURL { return source }
+        let base = source.deletingPathExtension().lastPathComponent
+        let ext = source.pathExtension
+        var dest = soundsDir.appendingPathComponent(source.lastPathComponent)
+        var n = 2
+        while fm.fileExists(atPath: dest.path) {
+            if fm.contentsEqual(atPath: dest.path, andPath: source.path) { return dest }
+            dest = soundsDir.appendingPathComponent("\(base) \(n).\(ext)")
+            n += 1
+        }
+        do {
+            try fm.copyItem(at: source, to: dest)
+            EventLog.append("sound-added \(dest.lastPathComponent)")
+            return dest
+        } catch {
+            EventLog.append("warn sound-add-failed \(error.localizedDescription)")
+            return nil
+        }
+    }
+}
+
 struct SoundRow: View {
     let title: String
     let detail: String
@@ -767,13 +840,23 @@ struct SoundRow: View {
             }
             Spacer()
             // Preview from the setter, so reloading the config from disk never plays a sound.
-            Picker(title, selection: Binding(get: { path }, set: { path = $0; model.preview($0) })) {
+            Picker(title, selection: Binding(get: { path }, set: { choice in
+                if choice == SoundImport.tag {
+                    // The menu item, not a sound: pick a file, copy it in, and use it here.
+                    if let added = SoundImport.choose() { path = added.path; model.preview(added.path) }
+                } else {
+                    path = choice
+                    model.preview(choice)
+                }
+            })) {
                 if !known.contains(path) { Text(displayName(path)).tag(path) }
                 ForEach(groups, id: \.0) { group in
                     Section(group.0) {
                         ForEach(group.1, id: \.path) { Text(displayName($0.path)).tag($0.path) }
                     }
                 }
+                Divider()
+                Text("Add Sound…").tag(SoundImport.tag)
             }
             .labelsHidden()
             .frame(width: 150)
@@ -899,7 +982,7 @@ struct SettingsView: View {
                         NSWorkspace.shared.open(soundsDir)
                     }
                 }
-                Text("Drop any .wav, .aiff, .mp3, .m4a or .caf file into the sounds folder to add it to the lists.")
+                Text("Choose Add Sound… in any sound menu, or drop a .wav, .aiff, .mp3, .m4a or .caf file into the sounds folder.")
                     .font(.caption).foregroundStyle(.secondary)
                 LabeledContent("Remove Claude Chimes") {
                     Button("Uninstall…", role: .destructive) { Uninstall.run() }
@@ -1423,6 +1506,16 @@ if args.contains("--setup") || args.contains("--repair") {
 if args.contains("--uninstall") {
     do { try Installer.uninstall(deleteData: args.contains("--delete-data")); print("Claude Chimes hooks removed.") }
     catch { FileHandle.standardError.write(Data("Uninstall failed: \(error.localizedDescription)\n".utf8)); exit(1) }
+    exit(0)
+}
+// `--add-sound <file>` copies a sound in, as Add Sound… does, and prints where it landed.
+if let i = args.firstIndex(of: "--add-sound") {
+    guard i + 1 < args.count, audioExts.contains(URL(fileURLWithPath: args[i + 1]).pathExtension.lowercased()),
+          let added = SoundImport.add(URL(fileURLWithPath: args[i + 1])) else {
+        FileHandle.standardError.write(Data("Give an audio file: .wav, .aiff, .mp3, .m4a or .caf.\n".utf8))
+        exit(1)
+    }
+    print(added.path)
     exit(0)
 }
 if let i = args.firstIndex(of: "--dismiss") {

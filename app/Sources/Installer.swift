@@ -17,6 +17,9 @@ enum Installer {
         ("UserPromptSubmit", "prompt", true), ("PostToolUse", "tool", true), ("SessionEnd", "end", true),
         ("StopFailure", "failure", false),   // 1.6: a turn ended with an error
         ("PreCompact", "compact", true),     // 1.6: Claude is about to compact the conversation
+        // 1.8: Notification's permission_prompt is unreliable in the Claude desktop app;
+        // PermissionRequest fires for every permission dialog. Both may fire; the hook chimes once.
+        ("PermissionRequest", "permission", false),
     ]
 
     /// Earlier versions installed fewer hooks. If some of ours are present but not all, the user
@@ -104,8 +107,22 @@ enum Installer {
         if fm.fileExists(atPath: settingsURL.path) {
             let stamp = DateFormatter.backupStamp.string(from: Date())
             try? fm.copyItem(at: settingsURL, to: settingsURL.appendingPathExtension("bak-chimes-\(stamp)"))
+            pruneBackups(keep: 5)
         }
         try Data((settings.serialized() + "\n").utf8).write(to: settingsURL, options: .atomic)
+    }
+
+    /// Keeps the newest `keep` settings backups this app made, so repairs and upgrades
+    /// don't leave a pile of them beside settings.json. Backups made by anything else are left alone.
+    static func pruneBackups(keep: Int) {
+        let dir = settingsURL.deletingLastPathComponent()
+        let prefix = settingsURL.lastPathComponent + ".bak-chimes-"
+        let names = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+            .filter { $0.hasPrefix(prefix) }
+            .sorted(by: >)   // the stamp sorts by time
+        for name in names.dropFirst(keep) {
+            try? FileManager.default.removeItem(at: dir.appendingPathComponent(name))
+        }
     }
 
     // MARK: Files

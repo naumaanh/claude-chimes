@@ -44,7 +44,7 @@ check "top-level key order kept" '[ "$(python3 -c "import json,sys; print(list(j
 check "number spelling kept (1.0e3)" 'grep -q "\"ratio\": 1.0e3" "$SETTINGS"'
 check "unrelated hooks kept" 'grep -q "my-guard" "$SETTINGS" && grep -q "echo other-stop" "$SETTINGS"'
 check "1.0 chime.sh hook replaced" '! grep -q "chimes/chime.sh" "$SETTINGS"'
-for ev in notification stop prompt tool end failure compact; do
+for ev in notification stop prompt tool end failure compact permission; do
   check "hook installed: $ev" 'grep -q "chimes/chime-hook '"$ev"'\"" "$SETTINGS"'
 done
 check "background hooks are async" '[ "$(grep -c "\"async\": true" "$SETTINGS")" = 4 ]'
@@ -62,6 +62,13 @@ hook s1 prompt CLAUDE_CODE_ENTRYPOINT=cli
 check "sending a message marks it working" '[ "$(status_of s1)" = working ]'
 hook s1 notification CLAUDE_CODE_ENTRYPOINT=cli
 check "permission prompt marks needs-input" '[ "$(status_of s1)" = needs-input ]'
+echo '{"session_id":"p1","cwd":"/tmp/p1","tool_name":"Bash","tool_input":{"command":"npm test"}}' | lim "$HOOK" permission > "$WORK/perm.out"
+check "PermissionRequest marks needs-input" '[ "$(status_of p1)" = needs-input ]'
+check "PermissionRequest names the command" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"message\"]==\"Claude wants to run: npm test\"" "$SESSIONS/p1.json"'
+check "PermissionRequest prints nothing, so it decides nothing" '[ ! -s "$WORK/perm.out" ]'
+check "PermissionRequest chimes" 'lastlog | grep -q "permission session=p1.*chime=played"'
+hook p1 notification
+check "a Notification for the same prompt doesn't chime again" 'lastlog | grep -q "notification session=p1.*chime=already-asked"'
 hook s1 tool
 check "a tool run returns it to working" '[ "$(status_of s1)" = working ]'
 hook s1 stop CLAUDE_CODE_ENTRYPOINT=cli
@@ -152,6 +159,16 @@ check "Other Macs setting is read from config" 'lim "$BIN" --doctor </dev/null |
 sed -i '' '/^otherMacs=/d' "$HOME/.claude/chimes/config"
 check "the hook never creates peers.json" '[ ! -e "$HOME/.claude/chimes/peers.json" ]'
 
+section "Adding your own sounds"
+mkdir -p "$WORK/mine" "$WORK/other"
+cp "$HOME/.claude/chimes/sounds/input-nudge.wav" "$WORK/mine/Ding.wav"
+ADDED="$(lim "$BIN" --add-sound "$WORK/mine/Ding.wav" </dev/null)"
+check "a sound is copied into the sounds folder" '[ "$ADDED" = "$HOME/.claude/chimes/sounds/Ding.wav" ] && [ -f "$ADDED" ]'
+check "adding the same file again reuses it" '[ "$(lim "$BIN" --add-sound "$WORK/mine/Ding.wav" </dev/null)" = "$ADDED" ]'
+cp "$HOME/.claude/chimes/sounds/done-spark.wav" "$WORK/other/Ding.wav"
+check "a different file with a taken name gets a number" '[ "$(lim "$BIN" --add-sound "$WORK/other/Ding.wav" </dev/null)" = "$HOME/.claude/chimes/sounds/Ding 2.wav" ]'
+check "a file that isn't audio is refused" '! lim "$BIN" --add-sound "$SETTINGS" </dev/null 2>/dev/null'
+
 section "Uninstall"
 cp "$ROOT/tests/fixtures/settings.json" "$SETTINGS"
 lim "$BIN" --setup </dev/null >/dev/null
@@ -161,6 +178,11 @@ check "keeps sounds without --delete-data" '[ -d "$HOME/.claude/chimes/sounds" ]
 lim "$BIN" --setup </dev/null >/dev/null; lim "$BIN" --uninstall --delete-data </dev/null >/dev/null
 check "--delete-data removes ~/.claude/chimes" '[ ! -e "$HOME/.claude/chimes" ]'
 check "backups were written" 'ls "$HOME/.claude" | grep -q "settings.json.bak-chimes-"'
+for n in 1 2 3 4 5 6 7 8; do echo '{}' > "$HOME/.claude/settings.json.bak-chimes-2020010100000$n"; done
+echo '{}' > "$HOME/.claude/settings.json.bak-other-tool"
+lim "$BIN" --setup </dev/null >/dev/null
+check "only the five newest of its own backups are kept" '[ "$(ls "$HOME/.claude" | grep -c "settings.json.bak-chimes-")" = 5 ] && ! ls "$HOME/.claude" | grep -q "bak-chimes-20200101000001"'
+check "a backup from another tool is left alone" '[ -f "$HOME/.claude/settings.json.bak-other-tool" ]'
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]
