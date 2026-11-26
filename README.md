@@ -155,7 +155,7 @@ Claude Code runs [hooks](https://docs.claude.com/en/docs/claude-code/hooks) on l
 | --- | --- | --- |
 | `UserPromptSubmit` | `prompt` | You sent a message, so the session is working and the turn's clock starts. Runs in the background. |
 | `Notification` | `notification` | Plays the Needs input chime and marks the session as needing you. Idle reminders are skipped. |
-| `PermissionRequest` | `permission` | A permission dialog opened. Plays the Needs input chime, unless `Notification` just did for the same prompt, and records what Claude is asking. Prints nothing, so it never answers the dialog. |
+| `PermissionRequest` | `permission --wait` | A permission dialog is about to open. Plays the Needs input chime, unless `Notification` just did for the same prompt, and records what Claude is asking. It prints nothing, so the dialog shows, unless you turned on Allow or deny from banners and you're away from the session: then it waits up to a minute for the banner's answer (timeout 75 s). |
 | `PostToolUse` | `tool` | A tool ran, so a pending permission prompt was answered and the session is working again. Runs in the background. |
 | `Stop` | `stop` | Marks the session as ready for your reply, and plays the Finished chime if the turn ran longer than your threshold. |
 | `StopFailure` | `failure` | The turn ended with an error. Plays the Turn failed chime and marks the session as failed. |

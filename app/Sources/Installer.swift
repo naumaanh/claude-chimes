@@ -60,8 +60,18 @@ enum Installer {
         (settings["hooks"]?[event]?.array ?? []).flatMap { ($0["hooks"]?.array ?? []).compactMap { $0["command"]?.string } }
     }
 
+    /// Seconds Claude Code gives a hook. The permission hook can wait for an answer from the
+    /// banner (up to `Permission.wait`), so it gets more; the rest return in milliseconds.
+    static func timeout(for arg: String) -> String { arg == "permission" ? "75" : "5" }
+
     static func hooksInstalled(_ settings: JSON) -> Bool {
-        wanted.allSatisfy { ev, arg, _ in commands(in: settings, event: ev).contains { $0.contains("chimes/chime-hook \(arg)") } }
+        wanted.allSatisfy { ev, arg, _ in
+            (settings["hooks"]?[ev]?.array ?? []).flatMap { $0["hooks"]?.array ?? [] }.contains { hook in
+                (hook["command"]?.string ?? "").contains("chimes/chime-hook \(arg)")
+                    // An older install's hook with a different timeout counts as out of date.
+                    && { if case let .number(n)? = hook["timeout"] { return n == timeout(for: arg) }; return false }()
+            }
+        }
     }
 
     static var isSetUp: Bool {
@@ -86,8 +96,11 @@ enum Installer {
         if install {
             for (event, arg, background) in wanted {
                 var hook: [(String, JSON)] = [("type", .string("command")),
-                                              ("command", .string("~/.claude/chimes/chime-hook \(arg)")),
-                                              ("timeout", .number("5"))]
+                                              // The permission hook may wait up to a minute, so its entry
+                                              // carries --wait: a session started on an older entry (5 s
+                                              // timeout) runs it without, and then it never waits.
+                                              ("command", .string("~/.claude/chimes/chime-hook \(arg)" + (arg == "permission" ? " --wait" : ""))),
+                                              ("timeout", .number(timeout(for: arg)))]
                 if background { hook.append(("async", .bool(true))) }
                 let group = JSON.object([("hooks", .array([.object(hook)]))])
                 if let i = events.firstIndex(where: { $0.0 == event }), let groups = events[i].1.array {

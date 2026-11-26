@@ -45,7 +45,7 @@ check "number spelling kept (1.0e3)" 'grep -q "\"ratio\": 1.0e3" "$SETTINGS"'
 check "unrelated hooks kept" 'grep -q "my-guard" "$SETTINGS" && grep -q "echo other-stop" "$SETTINGS"'
 check "1.0 chime.sh hook replaced" '! grep -q "chimes/chime.sh" "$SETTINGS"'
 for ev in notification stop prompt tool end failure compact permission; do
-  check "hook installed: $ev" 'grep -q "chimes/chime-hook '"$ev"'\"" "$SETTINGS"'
+  check "hook installed: $ev" 'grep -Eq "chimes/chime-hook '"$ev"'( --wait)?\"" "$SETTINGS"'
 done
 check "background hooks are async" '[ "$(grep -c "\"async\": true" "$SETTINGS")" = 4 ]'
 check "chimes copied to ~/.claude/chimes/sounds" '[ "$(ls "$HOME/.claude/chimes/sounds" | wc -l | tr -d " ")" = 7 ]'
@@ -232,6 +232,39 @@ echo "{\"session_id\":\"w4\",\"cwd\":\"/tmp/w4\",\"transcript_path\":\"$WORK/w4.
 check "a notice the app injects doesn't hide the turn's recap" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"reply\"]==\"Recap before a notice.\"" "$SESSIONS/w4.json"'
 check "without a recap, a closing question is pulled out" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"ask\"]==\"Should I commit it?\"" "$SESSIONS/w2.json"'
 rm -f "$SESSIONS"/w1.json "$SESSIONS"/w2.json "$SESSIONS"/w3.json "$SESSIONS"/w4.json
+
+section "Work receipts"
+K="$WORK/k.jsonl"
+cat > "$K" <<'JSONL'
+{"type":"user","message":{"role":"user","content":"ship it"}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/x/a.swift"}},{"type":"tool_use","id":"e2","name":"Write","input":{"file_path":"/x/b.swift"}},{"type":"tool_use","id":"e3","name":"Edit","input":{"file_path":"/x/a.swift"}},{"type":"tool_use","id":"e4","name":"Edit","input":{"file_path":"/x/c.swift"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"e1","content":"ok"},{"type":"tool_result","tool_use_id":"e2","content":"ok"},{"type":"tool_result","tool_use_id":"e3","content":"ok"},{"type":"tool_result","tool_use_id":"e4","content":"no match","is_error":true}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"python3 - <<'EOF'\nprint('git commit and git push and tests/run.sh are only text here')\nEOF"}},{"type":"tool_use","id":"b2","name":"Bash","input":{"command":"cd app && tests/run.sh > log 2>&1"}},{"type":"tool_use","id":"b3","name":"Bash","input":{"command":"git add -A && git commit -m \"fix: git push later\""}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"b1","content":"ok"},{"type":"tool_result","tool_use_id":"b2","content":"72 passed"},{"type":"tool_result","tool_use_id":"b3","content":"ok"}]}}
+JSONL
+echo "{\"session_id\":\"k1\",\"cwd\":\"/tmp/k1\",\"transcript_path\":\"$K\"}" | lim "$HOOK" stop
+check "the receipt counts what the turn really did" 'python3 -c "import json,sys; r=json.load(open(sys.argv[1]))[\"receipt\"]; assert r==\"Edited 2 files · tests passed · 1 unpushed commit\", r" "$SESSIONS/k1.json"'
+rm -f "$SESSIONS/k1.json"
+
+section "Allow or deny from the banner"
+printf 'bannerActions=1\n' >> "$HOME/.claude/chimes/config"
+perm() { echo '{"session_id":"q1","cwd":"/tmp/q1","tool_name":"Bash","tool_input":{"command":"npm test"}}' | env CLAUDE_CHIMES_APP_RUNNING=1 CLAUDE_CHIMES_PERMISSION_WAIT="$1" perl -e 'alarm 20; exec @ARGV' "$HOOK" permission --wait; }
+answer() { for _ in $(seq 1 40); do t=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('decisionToken') or '')" "$SESSIONS/q1.json" 2>/dev/null); [ -n "$t" ] && { mkdir -p "$HOME/.claude/chimes/decisions"; printf "$1" > "$HOME/.claude/chimes/decisions/$t"; return; }; sleep 0.1; done; }
+perm 10 > "$WORK/allow.out" & PID=$!; answer allow; wait $PID
+check "Allow on the banner allows this one request" 'python3 -c "import json,sys; d=json.load(open(sys.argv[1]))[\"hookSpecificOutput\"]; assert d[\"hookEventName\"]==\"PermissionRequest\" and d[\"decision\"]==dict(behavior=\"allow\"), d" "$WORK/allow.out"'
+check "after an answer the session is working again" '[ "$(status_of q1)" = working ]'
+perm 10 > "$WORK/deny.out" & PID=$!; answer deny; wait $PID
+check "Deny on the banner denies it" 'grep -q "\"behavior\":\"deny\"" "$WORK/deny.out"'
+perm 1 > "$WORK/none.out"
+check "no answer: the hook prints nothing, so Claude shows its own dialog" '[ ! -s "$WORK/none.out" ] && [ "$(status_of q1)" = needs-input ]'
+check "and the buttons are gone" 'python3 -c "import json,sys; assert not json.load(open(sys.argv[1])).get(\"decisionToken\")" "$SESSIONS/q1.json"'
+echo '{"session_id":"q2","cwd":"/tmp/q2","tool_name":"Bash","tool_input":{"command":"ls"}}' | env CLAUDE_CHIMES_APP_RUNNING=0 perl -e 'alarm 20; exec @ARGV' "$HOOK" permission > "$WORK/noapp.out"
+echo '{"session_id":"q3","cwd":"/tmp/q3","tool_name":"Bash","tool_input":{"command":"ls"}}' | env CLAUDE_CHIMES_APP_RUNNING=1 perl -e 'alarm 20; exec @ARGV' "$HOOK" permission > "$WORK/old.out"
+check "a session on the older hook entry (no --wait) never waits" '[ ! -s "$WORK/old.out" ] && ! grep "session=q3" "$HOME/.claude/chimes/events.log" | grep -q asking-banner'
+check "the permission hook gets a longer timeout" 'python3 -c "import json,sys; h=[x for g in json.load(open(sys.argv[1]))[\"hooks\"][\"PermissionRequest\"] for x in g[\"hooks\"] if \"chime-hook\" in x[\"command\"]][0]; assert h[\"timeout\"]==75 and h[\"command\"].endswith(\"permission --wait\"), h" "$SETTINGS"'
+check "without the menu bar app it never waits" '[ ! -s "$WORK/noapp.out" ] && ! grep -q "asking-banner" <(grep "session=q2" "$HOME/.claude/chimes/events.log")'
+sed -i '' '/^bannerActions=/d' "$HOME/.claude/chimes/config"
+rm -f "$SESSIONS"/q1.json "$SESSIONS"/q2.json "$SESSIONS"/q3.json
 
 section "Adding your own sounds"
 mkdir -p "$WORK/mine" "$WORK/other"

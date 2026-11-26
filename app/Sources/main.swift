@@ -49,6 +49,7 @@ struct Config: Equatable {
     var bannerPosition = BannerPosition.topRight
     var bannerSeconds = 8     // 0 keeps a banner until you dismiss it
     var bannerPreview = true  // 1.8: the start of Claude's reply in Finished banners
+    var bannerActions = false // 1.8: Allow/Deny on permission banners (off unless you turn it on)
     var finishedMinSeconds = 30   // only chime/banner Finished for turns at least this long (0 = always)
     var reminderMinutes = 5       // remind once about a prompt left unanswered this long (0 = off)
     var compactChime = false      // a soft cue when Claude is about to compact the conversation
@@ -143,6 +144,7 @@ struct Config: Equatable {
             case "showWorking": c.showWorking = on
             case "showContext": c.showContext = on
             case "bannerPreview": c.bannerPreview = on
+            case "bannerActions": c.bannerActions = on
             case "banner": c.banner = Badge(rawValue: v) ?? c.banner
             case "bannerPosition": c.bannerPosition = BannerPosition(rawValue: v) ?? c.bannerPosition
             case "bannerSeconds": c.bannerSeconds = max(0, min(120, Int(v) ?? c.bannerSeconds))
@@ -165,6 +167,7 @@ struct Config: Equatable {
         showWorking=\(showWorking ? 1 : 0)
         showContext=\(showContext ? 1 : 0)
         bannerPreview=\(bannerPreview ? 1 : 0)
+        bannerActions=\(bannerActions ? 1 : 0)
         banner=\(banner.rawValue)
         bannerPosition=\(bannerPosition.rawValue)
         bannerSeconds=\(bannerSeconds)
@@ -225,6 +228,8 @@ struct SessionState: Codable, Identifiable {
     var ask: String? = nil     // a question Claude left you at the end of the turn
     var replyIsRecap: Bool? = nil
     var askedVia: [String]? = nil  // which of Notification and PermissionRequest reported this prompt
+    var receipt: String? = nil     // what the turn did: "Edited 6 files · tests passed · 1 commit"
+    var decisionToken: String? = nil   // a permission prompt the banner may answer (see "permission")
 
     var isFailed: Bool { failed == true }
     var isRemote: Bool { remotePeer != nil }
@@ -475,6 +480,15 @@ enum ReplyPreview {
         var ask: String?
         /// The text is Claude's own recap of the turn, not the start of its reply.
         var isRecap = false
+        /// What the turn did, from its tool calls: "Edited 6 files · tests passed · 1 commit".
+        var receipt: String?
+    }
+
+    /// The first sentence: the recap's one-line status ("The banner is easier to read.").
+    static func headline(_ text: String) -> String {
+        let pattern = #"^.+?[.!?](?=\s+[A-Z0-9"“(]|$)"#
+        guard let range = text.range(of: pattern, options: .regularExpression) else { return text }
+        return String(text[range])
     }
 
     static func clean(_ text: String, max: Int = maxLength) -> String? {
@@ -499,15 +513,27 @@ enum ReplyPreview {
 
     static func from(payload: [String: Any], transcript: String?) -> Summary {
         let tail = transcript.flatMap(readTail)
-        if let tail, let recap = recap(in: tail) { return recap }
+        let receipt = tail.flatMap { Receipt.from(turn: turn(in: $0)) }
+        if let tail, var recap = recap(in: tail) {
+            recap.receipt = receipt
+            return recap
+        }
         let reply = (payload["last_assistant_message"] as? String) ?? tail.flatMap(lastReply)
-        guard let reply else { return Summary() }
+        guard let reply else { return Summary(receipt: receipt) }
         let ask = closingQuestion(reply)
         // Don't spend the preview's lines on the question it shows on its own line. Both are
         // cleaned first, so markdown in the question can't stop the match.
         var body = clean(reply, max: .max) ?? ""
         if let ask, let range = body.range(of: ask, options: .backwards) { body.removeSubrange(range) }
-        return Summary(text: clean(body), ask: ask)
+        return Summary(text: clean(body), ask: ask, receipt: receipt)
+    }
+
+    /// The rows of the current turn: everything after the last message you typed.
+    static func turn(in lines: [String]) -> ArraySlice<String> {
+        for i in lines.indices.reversed() where lines[i].contains("\"user\"") {
+            if let obj = object(lines[i]), isPrompt(obj) { return lines[(i + 1)...] }
+        }
+        return lines[...]
     }
 
     // MARK: Reading the transcript
@@ -522,7 +548,7 @@ enum ReplyPreview {
         return text.split(separator: "\n").map(String.init)
     }
 
-    private static func object(_ line: String) -> [String: Any]? {
+    static func object(_ line: String) -> [String: Any]? {
         try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
     }
 
@@ -572,6 +598,81 @@ enum ReplyPreview {
             if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return joined }
         }
         return nil
+    }
+}
+
+/**
+ What a turn actually did, read from its tool calls rather than from what Claude said about
+ them: files it changed, whether its last test run passed, commits and pushes. Only calls
+ that succeeded count. "Edited 6 files · tests passed · 2 commits · not pushed".
+ */
+enum Receipt {
+    static let editTools: Set<String> = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+    /// A command that runs a test suite, matched at the start of one step of a command.
+    static let testPattern = #"^(\S*/)?(npm (run )?test|pnpm (run )?test|yarn test|bun test|npx (jest|vitest)|jest|vitest|pytest|python3? -m (pytest|unittest)|swift test|go test|cargo test|xcodebuild[^\n]* test|rspec|phpunit|mix test|make test|tests?/run\.sh|run-tests?)"#
+
+    /**
+     The commands a shell line runs, one per step: "cd app && git commit -m x; git push" is
+     ["cd app", "git commit -m x", "git push"]. A heredoc's body is text, not commands, so
+     only its first line counts; that's how a script that merely mentions `git commit` is
+     told apart from a commit. Leading `VAR=value` settings and a timeout wrapper are dropped.
+     */
+    static func steps(_ command: String) -> [String] {
+        var text = command
+        if text.contains("<<"), let first = text.split(separator: "\n", maxSplits: 1).first { text = String(first) }
+        // Quoted text (a commit message, a python -c script) is never a command of its own.
+        text = text.replacingOccurrences(of: #"'[^']*'|"(\\.|[^"\\])*""#, with: "''", options: .regularExpression)
+        return text.components(separatedBy: CharacterSet(charactersIn: "\n;|&()")).compactMap { raw in
+            var step = raw.trimmingCharacters(in: .whitespaces)
+            while let r = step.range(of: #"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+"#, options: .regularExpression) { step.removeSubrange(r) }
+            for wrapper in ["perl -e '' ", "timeout ", "./heavy.sh ", "env ", "time "] where step.hasPrefix(wrapper) {
+                step.removeFirst(wrapper.count)
+            }
+            return step.isEmpty ? nil : step
+        }
+    }
+
+    static func from(turn: ArraySlice<String>) -> String? {
+        var calls: [String: (tool: String, input: [String: Any])] = [:]
+        var failed: Set<String> = []
+        var order: [String] = []
+        for line in turn where line.contains("tool_use") || line.contains("tool_result") {
+            guard let obj = ReplyPreview.object(line),
+                  let blocks = (obj["message"] as? [String: Any])?["content"] as? [[String: Any]] else { continue }
+            for b in blocks {
+                guard let id = (b["id"] as? String) ?? (b["tool_use_id"] as? String) else { continue }
+                if b["type"] as? String == "tool_use", let name = b["name"] as? String {
+                    calls[id] = (name, b["input"] as? [String: Any] ?? [:])
+                    order.append(id)
+                } else if b["type"] as? String == "tool_result", b["is_error"] as? Bool == true {
+                    failed.insert(id)
+                }
+            }
+        }
+        var files: Set<String> = []
+        var commits = 0, pushed = false
+        var tests: Bool?   // the last test run: passed or not
+        for id in order {
+            guard let call = calls[id] else { continue }
+            let ok = !failed.contains(id)
+            if editTools.contains(call.tool), ok,
+               let path = (call.input["file_path"] as? String) ?? (call.input["notebook_path"] as? String) {
+                files.insert(path)
+            }
+            guard call.tool == "Bash", let command = call.input["command"] as? String else { continue }
+            let steps = Self.steps(command)
+            if steps.contains(where: { $0.range(of: testPattern, options: .regularExpression) != nil }) { tests = ok }
+            guard ok else { continue }
+            commits += steps.filter { $0.hasPrefix("git commit") || $0.range(of: #"^git -C \S+ commit"#, options: .regularExpression) != nil }.count
+            if steps.contains(where: { $0.hasPrefix("git push") || $0.range(of: #"^git -C \S+ push"#, options: .regularExpression) != nil }) { pushed = true }
+        }
+        var parts: [String] = []
+        if !files.isEmpty { parts.append("Edited \(files.count) file\(files.count == 1 ? "" : "s")") }
+        if let tests { parts.append(tests ? "tests passed" : "tests failed") }
+        let plural = commits == 1 ? "" : "s"
+        if commits > 0 { parts.append(pushed ? "\(commits) commit\(plural) pushed" : "\(commits) unpushed commit\(plural)") }
+        else if pushed { parts.append("pushed") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 }
 
@@ -646,6 +747,79 @@ func playDetached(_ path: String, volume: Double) {
     p.waitUntilExit()
 }
 
+/**
+ Answering a permission prompt from the banner.
+
+ The PermissionRequest hook runs before Claude Code shows its dialog, and whatever it prints
+ decides. When you're away from the session, the hook marks the session with a one-time
+ token and waits; the banner shows Allow and Deny; a click writes the answer to
+ `decisions/<token>`, and the hook prints it. It steps aside (prints nothing, so the
+ dialog shows) as soon as you switch to the session's app, the menu bar app isn't running,
+ or `wait` runs out. An answer covers this one request only: no rule is ever added.
+ */
+enum Permission {
+    static let wait: TimeInterval = 60
+    static let appID = "io.github.naumaanh.claude-chimes"
+    static var dir: URL { chimesDir.appendingPathComponent("decisions") }
+
+    /// Whether to offer the banner's buttons for this prompt at all.
+    static func canAsk(config: Config, host: String?) -> Bool {
+        guard config.bannerActions, config.banner != .off, !config.inQuietHours(), appRunning else { return false }
+        return !isFront(host)
+    }
+
+    /// The menu bar app shows the banner, so without it there's nothing to wait for. The
+    /// tests set CLAUDE_CHIMES_APP_RUNNING, since they never run the app itself.
+    static var appRunning: Bool {
+        if let forced = ProcessInfo.processInfo.environment["CLAUDE_CHIMES_APP_RUNNING"] { return forced == "1" }
+        return !NSRunningApplication.runningApplications(withBundleIdentifier: appID).isEmpty
+    }
+
+    /// How long to wait; the tests shorten it with CLAUDE_CHIMES_PERMISSION_WAIT.
+    static var limit: TimeInterval {
+        ProcessInfo.processInfo.environment["CLAUDE_CHIMES_PERMISSION_WAIT"].flatMap(TimeInterval.init) ?? wait
+    }
+
+    /// The session's own app is in front, so you'll see the dialog: no reason to wait.
+    static func isFront(_ host: String?) -> Bool {
+        guard let host, let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else { return false }
+        return front == host
+    }
+
+    /// "allow" or "deny" from the banner, or nil when it should step aside.
+    static func wait(token: String, host: String?, limit: TimeInterval = limit) -> String? {
+        let file = dir.appendingPathComponent(token)
+        let end = Date().addingTimeInterval(limit)
+        defer { try? FileManager.default.removeItem(at: file) }
+        while Date() < end {
+            if let answer = try? String(contentsOf: file, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+               answer == "allow" || answer == "deny" { return answer }
+            if isFront(host) || !appRunning { return nil }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        return nil
+    }
+
+    /// Writes the banner's answer for the hook to pick up.
+    static func answer(token: String, behavior: String) {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let file = dir.appendingPathComponent(token)
+        try? Data(behavior.utf8).write(to: file, options: .atomic)
+        try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    }
+
+    /// The hook's answer to Claude Code, in its PermissionRequest output format.
+    static func output(_ behavior: String) -> String {
+        let decision: [String: Any] = behavior == "allow"
+            ? ["behavior": "allow"]
+            : ["behavior": "deny", "message": "Denied from the Claude Chimes banner."]
+        let out: [String: Any] = ["hookSpecificOutput": ["hookEventName": "PermissionRequest", "decision": decision]]
+        let data = (try? JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])) ?? Data()
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
 /// "Claude wants to run: npm test", from a PermissionRequest payload, in the words
 /// Claude Code's own notification uses.
 func permissionMessage(_ payload: [String: Any]) -> String {
@@ -672,7 +846,7 @@ func runHook(_ event: String) -> Never {
     @discardableResult
     func record(_ status: SessionState.Status, message: String?, workingSince: Date? = nil,
                 turnSeconds: Double? = nil, failed: Bool = false, summary: ReplyPreview.Summary? = nil,
-                askedVia: [String]? = nil, note: String = "") -> SessionState? {
+                askedVia: [String]? = nil, decisionToken: String? = nil, note: String = "") -> SessionState? {
         guard !id.isEmpty else { return nil }
         let previous = Sessions.read(id)
         let folder = URL(fileURLWithPath: cwd).lastPathComponent
@@ -688,7 +862,7 @@ func runHook(_ event: String) -> Never {
                              tty: pid.flatMap(ProcessCheck.tty) ?? previous?.tty,
                              termProgram: env["TERM_PROGRAM"] ?? previous?.termProgram,
                              reply: summary?.text, ask: summary?.ask, replyIsRecap: summary?.isRecap == true ? true : nil,
-                             askedVia: askedVia)
+                             askedVia: askedVia, receipt: summary?.receipt, decisionToken: decisionToken)
         Sessions.write(s)
         EventLog.append("\(event) session=\(short) status=\(status.rawValue) title=\"\(title)\"\(note)")
         return s
@@ -736,13 +910,27 @@ func runHook(_ event: String) -> Never {
         record(.needsInput, message: message, workingSince: prev?.workingSince, askedVia: via,
                note: same ? " chime=already-asked" : chime(config.input))
     case "permission":
-        // Claude Code's PermissionRequest: a permission dialog is open. Fires reliably in the
-        // desktop app, where Notification's permission_prompt sometimes doesn't. This hook
-        // prints nothing, so it makes no decision and the dialog shows as usual.
+        // Claude Code's PermissionRequest: a permission dialog is about to open. Fires
+        // reliably in the desktop app, where Notification's permission_prompt sometimes
+        // doesn't. Usually this prints nothing, so it decides nothing and the dialog shows.
+        // With "Allow or deny from banners" on and you away from the session, it waits for
+        // the banner's Allow or Deny instead (see Permission).
         let prev = Sessions.read(id)
         let (same, via) = samePrompt(prev)
-        record(.needsInput, message: permissionMessage(payload), workingSince: prev?.workingSince, askedVia: via,
-               note: same ? " chime=already-asked" : chime(config.input))
+        let message = permissionMessage(payload)
+        let host = env["__CFBundleIdentifier"] ?? prev?.appBundleID
+        let mayWait = CommandLine.arguments.contains("--wait")   // see Installer.timeout(for:)
+        let token = mayWait && Permission.canAsk(config: config, host: host) ? UUID().uuidString : nil
+        record(.needsInput, message: message, workingSince: prev?.workingSince, askedVia: via, decisionToken: token,
+               note: (same ? " chime=already-asked" : chime(config.input)) + (token == nil ? "" : " asking-banner"))
+        guard let token else { break }
+        if let behavior = Permission.wait(token: token, host: host) {
+            print(Permission.output(behavior))
+            record(.working, message: nil, workingSince: prev?.workingSince, note: " decided=\(behavior) via=banner")
+        } else {
+            // No answer: take the buttons away; Claude Code shows its own dialog now.
+            record(.needsInput, message: message, workingSince: prev?.workingSince, askedVia: via, note: " banner-unanswered")
+        }
     case "tool":
         // A tool ran, so a pending permission prompt was answered and Claude is working again.
         // (Runs after every tool call, so it only writes when something changes.)
@@ -1235,6 +1423,10 @@ struct SettingsView: View {
                 .disabled(model.config.banner == .off)
                 Toggle("Preview Claude's reply in banners", isOn: $model.config.bannerPreview)
                     .disabled(model.config.banner == .off)
+                Toggle("Allow or deny permission prompts from banners", isOn: $model.config.bannerActions)
+                    .disabled(model.config.banner == .off)
+                Text("When you're away from a session, its permission banner shows Allow once and Deny, and Claude waits up to a minute for your click before showing its own dialog. Switch to the session and you get the dialog at once.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Text("Turn this off if you share your screen and replies may be private.")
                     .font(.caption).foregroundStyle(.secondary)
                 HStack {
@@ -1393,6 +1585,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         banners.config = { [weak self] in self?.model.config ?? Config.load() }
         banners.onOpen = { [weak self] s in self?.open(s) }
         banners.onDismiss = { [weak self] s in if !s.id.hasPrefix("test-banner") { self?.dismiss(s, in: nil) } }
+        banners.onDecide = { s, behavior in
+            guard !s.id.hasPrefix("test-banner"), let token = s.decisionToken else { return }
+            Permission.answer(token: token, behavior: behavior)
+            EventLog.append("decide session=\(s.id.prefix(8)) \(behavior) via=banner")
+        }
         model.onTestBanner = { [weak self] in self?.showTestBanner() }
         model.peers.onRemote = { [weak self] peer, list, baseline in self?.model.setRemote(peer, list, baseline: baseline) }
         model.peers.onRemoteGone = { [weak self] peer in self?.model.removeRemote(peer) }
@@ -1606,10 +1803,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         done.reply = "The release notes are written in CHANGELOG.md, with the permission hook first and the Homebrew cask last. All tests pass. Nothing is pushed yet."
         done.replyIsRecap = true
         done.ask = "Push the branch and open a pull request?"
+        done.receipt = "Edited 6 files · tests passed · 2 unpushed commits"
         banners.show(done)
-        banners.show(SessionState(id: "test-banner-input", status: .needsInput, title: "Sample: fix the login redirect",
-                                  cwd: "/sample/api-server", message: "Claude wants to run: npm test -- --grep \"login redirect\"",
-                                  appBundleID: nil, updatedAt: Date()))
+        var input = SessionState(id: "test-banner-input", status: .needsInput, title: "Sample: fix the login redirect",
+                                 cwd: "/sample/api-server", message: "Claude wants to run: npm test -- --grep \"login redirect\"",
+                                 appBundleID: nil, updatedAt: Date())
+        input.askedVia = ["permission"]
+        // Buttons only when the setting is on; on a sample they just close it.
+        if model.config.bannerActions { input.decisionToken = "sample" }
+        banners.show(input)
     }
 
     func dismiss(_ s: SessionState, in menu: NSMenu?) {
@@ -1954,9 +2156,18 @@ if let i = args.firstIndex(of: "--snapshot-banner"), i + 1 < args.count {
             s.replyIsRecap = true
             if !args.contains("--no-ask") { s.ask = "Push the branch and open a pull request?" }
         }
-        if args.contains("--plain") { s.cwd = ""; s.reply = nil }
+        if finished { s.receipt = "Edited 6 files · tests passed · 2 unpushed commits" }
+        if args.contains("--permission") { s.askedVia = ["permission"]; s.decisionToken = "demo" }
+        if args.contains("--plain") { s.cwd = ""; s.reply = nil; s.receipt = nil }
         let pad: CGFloat = 20
-        let banner = BannerView(session: s, onOpen: {}, onDismiss: {})
+        var banner = BannerView(session: s, onOpen: {}, onDismiss: {})
+        if args.contains("--digest") {
+            var a = s; a.id = "a"; a.title = "Fix the login redirect"; a.status = .needsInput; a.ask = nil
+            a.message = "Claude wants to run: npm test"; a.askedVia = ["permission"]
+            var b = s; b.id = "b"; b.title = "Write the release notes"; b.status = .finished; b.ask = nil
+            var d = s; d.id = "d"; d.title = "Refactor the settings parser"; d.status = .finished; d.ask = nil
+            banner = BannerView(card: BannerCard(digest: [b, a, d]), onOpen: {}, onDismiss: {})
+        }
         let canvas = NSView(frame: NSRect(x: 0, y: 0, width: banner.frame.width + 2 * pad, height: banner.frame.height + 2 * pad))
         canvas.wantsLayer = true
         canvas.layer?.backgroundColor = (dark ? NSColor(calibratedRed: 0.13, green: 0.15, blue: 0.2, alpha: 1)

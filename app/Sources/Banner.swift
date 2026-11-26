@@ -7,114 +7,171 @@
 
 import AppKit
 
-/// The card's contents. Also used by --snapshot-banner.
+/**
+ What a banner says, worked out before anything is drawn: the verdict first (does this need
+ you, and for what), then the session, one line of status, the question or the buttons that
+ answer it, what the turn actually did, and small facts.
+ */
+struct BannerCard {
+    enum Style { case body, ask, receipt, facts }
+    struct Line { let text: String; let style: Style; let maxLines: Int }
+
+    var symbol: String
+    var tint: NSColor
+    var caption: String
+    var title: String
+    var lines: [Line] = []
+    /// Allow once and Deny, for a permission prompt the banner may answer.
+    var decides = false
+
+    init(session s: SessionState, preview: Bool = true) {
+        let needs = s.status == .needsInput, failed = s.isFailed
+        let permission = needs && (s.askedVia?.contains("permission") == true || (s.message ?? "").hasPrefix("Claude wants"))
+        let ask = (!needs && !failed && preview) ? s.ask : nil
+        if needs {
+            symbol = permission ? "hand.raised.fill" : "exclamationmark.bubble.fill"
+            tint = .systemRed
+            caption = permission ? "Needs your permission" : "Needs your answer"
+        } else if failed {
+            symbol = "exclamationmark.triangle.fill"; tint = .systemOrange; caption = "Turn failed"
+        } else if ask != nil {
+            symbol = "questionmark.bubble.fill"; tint = .controlAccentColor; caption = "Needs your decision"
+        } else {
+            symbol = "checkmark.circle.fill"; tint = .systemGreen; caption = "Done · nothing needs you"
+        }
+        if let host = s.remoteHost { caption += " · on \(host)" }
+        title = s.title
+
+        // One line of status: the recap's first sentence, the command, or the error.
+        let status: String = needs ? (s.message ?? "Claude is waiting for you")
+            : failed ? (s.message ?? "Claude hit an error")
+            : (preview ? s.reply.map(ReplyPreview.headline) : nil) ?? "Claude finished a reply"
+        lines.append(Line(text: status, style: .body, maxLines: 2))
+        if let ask { lines.append(Line(text: ask, style: .ask, maxLines: 2)) }
+        decides = needs && s.decisionToken != nil && !s.isRemote
+        if let receipt = s.receipt, !needs { lines.append(Line(text: receipt, style: .receipt, maxLines: 1)) }
+
+        var facts: [String] = []
+        if !needs, let t = s.turnSeconds { facts.append(BannerView.duration(t)) }
+        if s.remoteHost == nil, let c = ContextUse.label(s.transcriptPath) { facts.append(c) }
+        let folder = s.cwd.isEmpty ? "" : URL(fileURLWithPath: s.cwd).lastPathComponent
+        if !folder.isEmpty, folder != "/", !s.title.localizedCaseInsensitiveContains(folder) { facts.append(folder) }
+        if !facts.isEmpty { lines.append(Line(text: facts.joined(separator: " · "), style: .facts, maxLines: 1)) }
+    }
+
+    /// One card for several sessions that arrived together: "1 needs you · 2 done".
+    init(digest sessions: [SessionState]) {
+        let needing = sessions.filter { $0.status == .needsInput || $0.isFailed || $0.ask != nil }
+        symbol = needing.isEmpty ? "checkmark.circle.fill" : "square.stack.fill"
+        tint = needing.isEmpty ? .systemGreen : .systemRed
+        caption = "\(sessions.count) sessions"
+        let done = sessions.count - needing.count
+        title = [needing.isEmpty ? nil : "\(needing.count) need\(needing.count == 1 ? "s" : "") you",
+                 done == 0 ? nil : "\(done) done"].compactMap { $0 }.joined(separator: " · ")
+        // Most urgent first, one line each.
+        for s in (needing + sessions.filter { !needing.map(\.id).contains($0.id) }).prefix(4) {
+            let what = BannerCard(session: s).caption.components(separatedBy: " · ").first ?? ""
+            lines.append(Line(text: "\(s.title) — \(what)", style: needing.contains { $0.id == s.id } ? .body : .receipt, maxLines: 1))
+        }
+        if sessions.count > 4 { lines.append(Line(text: "and \(sessions.count - 4) more", style: .facts, maxLines: 1)) }
+    }
+}
+
+/// The card's view. Also used by --snapshot-banner.
 final class BannerView: NSView {
     static let width: CGFloat = 360
-    /// The height a banner had before 1.8, and still has with nothing extra to say.
+    /// The smallest a banner gets: a caption, a title and one line.
     static let size = NSSize(width: width, height: 66)
+    static let textX: CGFloat = 46
+    static let textWidth: CGFloat = 280
+    static let lineSpacing: CGFloat = 2
 
     private let onOpen: () -> Void
     private let onDismiss: () -> Void
     var onHoverChange: ((Bool) -> Void)?
+    /// Allow once / Deny. Set by the banner center for a card that `decides`.
+    var onDecide: ((String) -> Void)?
 
-    /**
-     The banner's lines, top to bottom: what happened, the session, what it is about (the
-     command or question it waits on, the error, or a summary of the turn: Claude's own recap
-     where the app wrote one, up to three lines, else the start of the reply), the question
-     Claude left you if any, then small facts (how long, how full the context is, which
-     folder). The card is as tall as that.
-     */
-    init(session s: SessionState, preview: Bool = true, onOpen: @escaping () -> Void, onDismiss: @escaping () -> Void) {
+    convenience init(session s: SessionState, preview: Bool = true, onOpen: @escaping () -> Void, onDismiss: @escaping () -> Void) {
+        self.init(card: BannerCard(session: s, preview: preview), onOpen: onOpen, onDismiss: onDismiss)
+    }
+
+    init(card: BannerCard, onOpen: @escaping () -> Void, onDismiss: @escaping () -> Void) {
         self.onOpen = onOpen
         self.onDismiss = onDismiss
-        let needsInput = s.status == .needsInput, didFail = s.isFailed
-        let body: String = needsInput ? (s.message ?? "Claude is waiting for you")
-            : didFail ? (s.message ?? "Claude hit an error")
-            : (preview ? s.reply : nil) ?? "Claude finished a reply"   // the time is in the facts line
-        // A question at the end of a turn is the thing to act on, so it gets its own line.
-        let ask = (!needsInput && !didFail && preview) ? s.ask : nil
-        var facts: [String] = []
-        if !needsInput, let t = s.turnSeconds { facts.append(BannerView.duration(t)) }
-        if s.remoteHost == nil, let c = ContextUse.label(s.transcriptPath) { facts.append(c) }
-        let folder = s.cwd.isEmpty ? "" : URL(fileURLWithPath: s.cwd).lastPathComponent
-        if !folder.isEmpty, folder != "/", !s.title.localizedCaseInsensitiveContains(folder) { facts.append(folder) }
-        let layout = Layout(body: body, ask: ask, facts: facts.joined(separator: " · "),
-                            maxLines: s.replyIsRecap == true && !needsInput ? 3 : 2)
-        super.init(frame: NSRect(x: 0, y: 0, width: Self.width, height: layout.height))
-        build(s, layout: layout, needs: needsInput, failed: didFail)
+        let measured = card.lines.map { Self.height(of: $0) }
+        let buttons: CGFloat = card.decides ? 30 : 0
+        let body = zip(card.lines, measured).reduce(CGFloat(0)) { $0 + $1.1 + Self.gap(before: $1.0.style) }
+        let height = max(Self.size.height, 8 + 14 + 18 + body + buttons + 10)
+        super.init(frame: NSRect(x: 0, y: 0, width: Self.width, height: height))
+        build(card, heights: measured)
     }
 
-    /// Where each line goes, measured before the view exists so the card can be sized to fit.
-    struct Layout {
-        let body: String
-        let ask: String?
-        let facts: String
-        let maxLines: Int
-        let bodyHeight: CGFloat
-        let askHeight: CGFloat
-        let height: CGFloat
-        static let textWidth: CGFloat = 270
-        static let bodyFont = NSFont.systemFont(ofSize: 12.5)
-        static let lineSpacing: CGFloat = 2
-        /// Near-black in light mode, near-white in dark. Built per appearance, because a
-        /// system color with an alpha applied is fixed to whichever appearance was current.
-        static let bodyColor = NSColor(name: nil) { appearance in
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    // MARK: Text
+
+    static func font(_ style: BannerCard.Style) -> NSFont {
+        switch style {
+        case .body: return .systemFont(ofSize: 12.5)
+        case .ask: return .systemFont(ofSize: 12.5, weight: .medium)
+        case .receipt: return .systemFont(ofSize: 11.5, weight: .medium)
+        case .facts: return .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        }
+    }
+
+    /// Near-black in light mode, near-white in dark. Built per appearance, because a system
+    /// color with an alpha applied is fixed to whichever appearance was current.
+    static func strong(_ alpha: (light: CGFloat, dark: CGFloat)) -> NSColor {
+        NSColor(name: nil) { appearance in
             appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-                ? NSColor(white: 1, alpha: 0.85) : NSColor(white: 0, alpha: 0.8)
-        }
-
-        /// The body's text, near-black and with a little air between its two lines: it is
-        /// the line that says whether to look now, so it reads first after the title.
-        static func bodyText(_ body: String) -> NSAttributedString {
-            let style = NSMutableParagraphStyle()
-            style.lineSpacing = lineSpacing
-            style.lineBreakMode = .byWordWrapping
-            return NSAttributedString(string: body, attributes: [
-                .font: bodyFont,
-                .foregroundColor: bodyColor,
-                .paragraphStyle: style,
-            ])
-        }
-
-        static let askFont = NSFont.systemFont(ofSize: 12.5, weight: .medium)
-
-        /// The height of `lines` lines of body text, with the spacing between them.
-        static func height(lines: Int, font: NSFont) -> CGFloat {
-            let line = ceil(font.ascender - font.descender + font.leading) + 1
-            return line * CGFloat(lines) + lineSpacing * CGFloat(max(0, lines - 1))
-        }
-
-        static func lines(_ text: NSAttributedString, font: NSFont, max: Int) -> Int {
-            let line = ceil(font.ascender - font.descender + font.leading) + 1
-            let measured = text.boundingRect(with: NSSize(width: textWidth, height: 1000),
-                                             options: [.usesLineFragmentOrigin, .usesFontLeading]).height
-            return min(max, Swift.max(1, Int(((measured + lineSpacing) / (line + lineSpacing)).rounded(.up))))
-        }
-
-        init(body: String, ask: String?, facts: String, maxLines: Int = 2) {
-            self.body = body
-            self.ask = ask
-            self.facts = facts
-            self.maxLines = maxLines
-            bodyHeight = Self.height(lines: Self.lines(Self.bodyText(body), font: Self.bodyFont, max: maxLines), font: Self.bodyFont)
-            askHeight = ask.map { Self.height(lines: Self.lines(Self.askText($0), font: Self.askFont, max: 2), font: Self.askFont) + 4 } ?? 0
-            // 8 top, caption 14, title 17, body, the question, facts 13 with a 6 pt gap, 9 bottom.
-            height = 8 + 14 + 18 + bodyHeight + askHeight + (facts.isEmpty ? 0 : 20) + 9
-        }
-
-        /// The question Claude left you, in the accent color: the one thing to do next.
-        static func askText(_ ask: String) -> NSAttributedString {
-            let style = NSMutableParagraphStyle()
-            style.lineSpacing = lineSpacing
-            style.lineBreakMode = .byWordWrapping
-            return NSAttributedString(string: ask, attributes: [
-                .font: askFont, .foregroundColor: NSColor.controlAccentColor, .paragraphStyle: style,
-            ])
+                ? NSColor(white: 1, alpha: alpha.dark) : NSColor(white: 0, alpha: alpha.light)
         }
     }
 
-    private func build(_ s: SessionState, layout: Layout, needs: Bool, failed: Bool) {
-        let height = layout.height
+    static func color(_ style: BannerCard.Style) -> NSColor {
+        switch style {
+        case .body: return strong((0.8, 0.85))
+        case .ask: return .controlAccentColor
+        case .receipt: return strong((0.62, 0.7))
+        case .facts: return .secondaryLabelColor
+        }
+    }
+
+    static func text(_ line: BannerCard.Line) -> NSAttributedString {
+        let style = NSMutableParagraphStyle()
+        style.lineSpacing = lineSpacing
+        style.lineBreakMode = .byWordWrapping
+        return NSAttributedString(string: line.text, attributes: [
+            .font: font(line.style), .foregroundColor: color(line.style), .paragraphStyle: style,
+        ])
+    }
+
+    /// The height a line of the card needs, up to its `maxLines`.
+    static func height(of line: BannerCard.Line) -> CGFloat {
+        let f = font(line.style)
+        let one = ceil(f.ascender - f.descender + f.leading) + 1
+        let measured = text(line).boundingRect(with: NSSize(width: textWidth, height: 1000),
+                                               options: [.usesLineFragmentOrigin, .usesFontLeading]).height
+        let count = min(line.maxLines, max(1, Int(((measured + lineSpacing) / (one + lineSpacing)).rounded(.up))))
+        return one * CGFloat(count) + lineSpacing * CGFloat(count - 1)
+    }
+
+    /// Space above a line: the question and the receipt stand a little apart from the status.
+    static func gap(before style: BannerCard.Style) -> CGFloat {
+        switch style {
+        case .body: return 0
+        case .ask, .receipt: return 4
+        case .facts: return 3
+        }
+    }
+
+    // MARK: Building
+
+    private let backing = NSView()
+
+    private func build(_ card: BannerCard, heights: [CGFloat]) {
+        let height = bounds.height
 
         let blur = NSVisualEffectView(frame: bounds)
         blur.material = .popover
@@ -136,52 +193,45 @@ final class BannerView: NSView {
         blur.addSubview(backing)
         updateBacking()
 
-        // The icon sits beside the caption and title, where the eye starts, not mid-card.
+        // The icon sits beside the caption and title, where the eye starts.
         let icon = NSImageView(frame: NSRect(x: 14, y: height - 8 - 32, width: 22, height: 22))
-        icon.image = NSImage(systemSymbolName: needs ? "exclamationmark.bubble.fill"
-                                : failed ? "exclamationmark.triangle.fill" : "checkmark.bubble.fill",
-                             accessibilityDescription: nil)
+        icon.image = NSImage(systemSymbolName: card.symbol, accessibilityDescription: nil)
         icon.symbolConfiguration = .init(pointSize: 17, weight: .regular)
-        let asks = layout.ask != nil
-        let tint: NSColor = needs ? .systemRed : failed ? .systemOrange : asks ? .controlAccentColor : .secondaryLabelColor
-        icon.contentTintColor = tint
-        if asks { icon.image = NSImage(systemSymbolName: "questionmark.bubble.fill", accessibilityDescription: nil) }
+        icon.contentTintColor = card.tint
+        addSubview(icon)
 
-        let what = needs ? "Needs your input" : failed ? "Turn failed" : asks ? "Waiting on your answer" : "Ready for your reply"
-        let caption = NSTextField(labelWithString: s.remoteHost.map { "\(what) · on \($0)" } ?? what)
+        let caption = NSTextField(labelWithString: card.caption)
         caption.lineBreakMode = .byTruncatingTail
-        caption.font = .systemFont(ofSize: 11, weight: .medium)
-        caption.textColor = tint
-        caption.frame = NSRect(x: 46, y: height - 8 - 14, width: Layout.textWidth, height: 14)
+        caption.font = .systemFont(ofSize: 11, weight: .semibold)
+        caption.textColor = card.tint
+        caption.frame = NSRect(x: Self.textX, y: height - 8 - 14, width: Self.textWidth, height: 14)
+        addSubview(caption)
 
-        let title = NSTextField(labelWithString: s.title)
+        let title = NSTextField(labelWithString: card.title)
         title.font = .systemFont(ofSize: 13, weight: .semibold)
         title.lineBreakMode = .byTruncatingTail
-        title.frame = NSRect(x: 46, y: height - 8 - 14 - 18, width: Layout.textWidth, height: 17)
+        title.frame = NSRect(x: Self.textX, y: height - 8 - 14 - 18, width: Self.textWidth, height: 17)
+        addSubview(title)
 
-        let detail = NSTextField(wrappingLabelWithString: layout.body)
-        detail.attributedStringValue = Layout.bodyText(layout.body)
-        detail.maximumNumberOfLines = layout.maxLines
-        // Word wrap with the last line cut: truncating-tail mode would hold it to one line.
-        detail.lineBreakMode = .byWordWrapping
-        detail.cell?.truncatesLastVisibleLine = true
-        detail.frame = NSRect(x: 46, y: height - 8 - 14 - 18 - layout.bodyHeight, width: Layout.textWidth, height: layout.bodyHeight)
-
-        let question = NSTextField(wrappingLabelWithString: layout.ask ?? "")
-        question.attributedStringValue = Layout.askText(layout.ask ?? "")
-        question.maximumNumberOfLines = 2
-        question.lineBreakMode = .byWordWrapping
-        question.cell?.truncatesLastVisibleLine = true
-        question.frame = NSRect(x: 46, y: detail.frame.minY - layout.askHeight,
-                                width: Layout.textWidth, height: max(0, layout.askHeight - 4))
-        question.isHidden = layout.ask == nil
-
-        let facts = NSTextField(labelWithString: layout.facts)
-        facts.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        facts.textColor = .secondaryLabelColor
-        facts.lineBreakMode = .byTruncatingTail
-        facts.frame = NSRect(x: 46, y: 9, width: Layout.textWidth, height: 14)
-        facts.isHidden = layout.facts.isEmpty
+        var y = height - 8 - 14 - 18
+        var spoken: [String] = [card.caption, card.title]
+        for (line, h) in zip(card.lines, heights) {
+            y -= Self.gap(before: line.style) + h
+            let field = NSTextField(wrappingLabelWithString: line.text)
+            field.attributedStringValue = Self.text(line)
+            field.maximumNumberOfLines = line.maxLines
+            // Word wrap with the last line cut: truncating-tail mode would hold it to one line.
+            field.lineBreakMode = .byWordWrapping
+            field.cell?.truncatesLastVisibleLine = true
+            field.frame = NSRect(x: Self.textX, y: y, width: Self.textWidth, height: h)
+            addSubview(field)
+            spoken.append(line.text)
+            // The buttons go right under the status line they answer.
+            if card.decides, line.style == .body, spoken.count == 3 {
+                y -= 30
+                addButtons(y: y + 2)
+            }
+        }
 
         let close = NSButton(frame: NSRect(x: Self.width - 32, y: height - 8 - 26, width: 22, height: 22))
         close.isBordered = false
@@ -193,21 +243,35 @@ final class BannerView: NSView {
         close.target = self
         close.action = #selector(closeTapped)
         close.toolTip = "Dismiss (done with this session)"
-
-        [icon, caption, title, detail, question, facts, close].forEach(addSubview)
+        addSubview(close)
 
         setAccessibilityElement(true)
         setAccessibilityRole(.button)
-        setAccessibilityLabel("\(caption.stringValue): \(s.title). \(layout.body)" + (layout.ask.map { " \($0)" } ?? "")
-                              + (layout.facts.isEmpty ? "" : ". \(layout.facts)"))
-        setAccessibilityCustomActions([NSAccessibilityCustomAction(name: "Dismiss") { [weak self] in
-            self?.onDismiss(); return true
-        }])
+        setAccessibilityLabel(spoken.joined(separator: ". "))
+        var actions = [NSAccessibilityCustomAction(name: "Dismiss") { [weak self] in self?.onDismiss(); return true }]
+        if card.decides {
+            actions.append(NSAccessibilityCustomAction(name: "Allow once") { [weak self] in self?.onDecide?("allow"); return true })
+            actions.append(NSAccessibilityCustomAction(name: "Deny") { [weak self] in self?.onDecide?("deny"); return true })
+        }
+        setAccessibilityCustomActions(actions)
     }
 
-    required init?(coder: NSCoder) { fatalError("not used") }
-
-    private let backing = NSView()
+    /// Deny on the left and Allow once on the right, the way macOS lays out a dialog. Neither
+    /// is the default: a stray Return or click elsewhere on the card never approves anything.
+    private func addButtons(y: CGFloat) {
+        let deny = NSButton(title: "Deny", target: self, action: #selector(denyTapped))
+        let allow = NSButton(title: "Allow once", target: self, action: #selector(allowTapped))
+        for (button, x, w) in [(deny, Self.textX, CGFloat(80)), (allow, Self.textX + 88, CGFloat(100))] {
+            button.bezelStyle = .push
+            button.controlSize = .small
+            button.font = .systemFont(ofSize: 12, weight: .medium)
+            button.frame = NSRect(x: x - 6, y: y, width: w, height: 26)
+            button.keyEquivalent = ""
+            addSubview(button)
+        }
+        allow.bezelColor = .controlAccentColor
+        allow.toolTip = "Allow this one request. No rule is added."
+    }
 
     /// Layer colors don't follow light and dark mode by themselves, so resolve it again
     /// whenever the appearance changes.
@@ -245,6 +309,8 @@ final class BannerView: NSView {
     }
     override func accessibilityPerformPress() -> Bool { onOpen(); return true }
     @objc private func closeTapped() { onDismiss() }
+    @objc private func allowTapped() { onDecide?("allow") }
+    @objc private func denyTapped() { onDecide?("deny") }
 }
 
 /// Shows, stacks, times out and removes banners. At most three are on screen; a newer one
@@ -256,8 +322,16 @@ final class BannerCenter {
         let panel: NSPanel
         var timer: Timer?
         var hovering = false
-        init(id: String, panel: NSPanel) { self.id = id; self.panel = panel }
+        /// The sessions on this card: one, or several for the digest.
+        var sessions: [SessionState]
+        /// It has Allow/Deny: it never folds into the digest, and it never times out.
+        let decides: Bool
+        init(id: String, panel: NSPanel, sessions: [SessionState], decides: Bool) {
+            self.id = id; self.panel = panel; self.sessions = sessions; self.decides = decides
+        }
     }
+
+    static let digestID = "digest"
 
     private var entries: [Entry] = []      // newest first
     private let maxVisible = 3
@@ -265,16 +339,59 @@ final class BannerCenter {
     var config: () -> Config = { Config.load() }
     var onOpen: (SessionState) -> Void = { _ in }
     var onDismiss: (SessionState) -> Void = { _ in }
+    /// Allow once or Deny on a permission banner: the session and "allow" or "deny".
+    var onDecide: (SessionState, String) -> Void = { _, _ in }
 
     private var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
+    /**
+     Shows a session's banner. A third ordinary banner arriving while two are up folds all of
+     them into one digest card ("1 needs you · 2 done"), and later ones join it. Permission
+     banners with buttons always stand alone, since they wait on you.
+     */
     func show(_ s: SessionState) {
         remove(id: s.id, animated: false)
         let c = config()
-
-        let view = BannerView(session: s, preview: c.bannerPreview,
+        let card = BannerCard(session: s, preview: c.bannerPreview)
+        let plain = entries.filter { !$0.decides && $0.id != Self.digestID }
+        if !card.decides, let digest = entries.first(where: { $0.id == Self.digestID }) {
+            showDigest(digest.sessions + [s])
+            return
+        }
+        if !card.decides, plain.count >= 2 {
+            let folded = plain.flatMap(\.sessions) + [s]
+            for e in plain { dropEntry(e.id, animated: false) }
+            showDigest(folded)
+            return
+        }
+        let view = BannerView(card: card,
                               onOpen: { [weak self] in self?.remove(id: s.id, animated: true); self?.onOpen(s) },
                               onDismiss: { [weak self] in self?.remove(id: s.id, animated: true); self?.onDismiss(s) })
+        view.onDecide = { [weak self] behavior in
+            self?.remove(id: s.id, animated: true)
+            self?.onDecide(s, behavior)
+        }
+        present(view, entry: { Entry(id: s.id, panel: $0, sessions: [s], decides: card.decides) }, config: c)
+    }
+
+    /// The digest card, replacing any earlier one. Clicking it opens the most urgent session.
+    private func showDigest(_ sessions: [SessionState]) {
+        dropEntry(Self.digestID, animated: false)
+        var seen = Set<String>()
+        let list = sessions.reversed().filter { seen.insert($0.id).inserted }.reversed() as [SessionState]
+        let c = config()
+        let card = BannerCard(digest: list)
+        let urgent = list.first { $0.status == .needsInput || $0.isFailed || $0.ask != nil } ?? list.last
+        let view = BannerView(card: card,
+                              onOpen: { [weak self] in
+                                  self?.dropEntry(Self.digestID, animated: true)
+                                  if let urgent { self?.onOpen(urgent) }
+                              },
+                              onDismiss: { [weak self] in self?.dropEntry(Self.digestID, animated: true) })
+        present(view, entry: { Entry(id: Self.digestID, panel: $0, sessions: list, decides: false) }, config: c)
+    }
+
+    private func present(_ view: BannerView, entry make: (NSPanel) -> Entry, config c: Config) {
         let panel = NSPanel(contentRect: NSRect(origin: .zero, size: view.frame.size),
                             styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = .statusBar
@@ -286,7 +403,7 @@ final class BannerCenter {
         panel.hidesOnDeactivate = false
         panel.becomesKeyOnlyIfNeeded = true
 
-        let entry = Entry(id: s.id, panel: panel)
+        let entry = make(panel)
         view.onHoverChange = { [weak self, weak entry] on in
             guard let self, let entry else { return }
             entry.hovering = on
@@ -295,7 +412,9 @@ final class BannerCenter {
         panel.contentView = view
 
         entries.insert(entry, at: 0)
-        while entries.count > maxVisible, let oldest = entries.last { remove(id: oldest.id, animated: true) }
+        while entries.count > maxVisible, let oldest = entries.last(where: { !$0.decides }) ?? entries.last {
+            dropEntry(oldest.id, animated: true)
+        }
 
         let target = frame(at: 0, position: c.bannerPosition)
         let fromTop = c.bannerPosition != .bottomRight
@@ -309,11 +428,25 @@ final class BannerCenter {
             panel.animator().setFrame(target, display: true)
         }
         relayout(skipNewest: true)
-        schedule(entry, seconds: c.bannerSeconds)
+        // A permission banner stays until it's answered: the hook takes it away when it stops waiting.
+        if !entry.decides { schedule(entry, seconds: c.bannerSeconds) }
     }
 
-    /// Removes the banner for a session (for example after you reply to it).
+    /// Removes the banner for a session (for example after you reply to it). A session in the
+    /// digest leaves the digest, which closes once it's empty.
     func remove(id: String, animated: Bool) {
+        if let digest = entries.first(where: { $0.id == Self.digestID }), digest.sessions.contains(where: { $0.id == id }) {
+            let rest = digest.sessions.filter { $0.id != id }
+            if rest.count >= 2 { showDigest(rest) } else {
+                dropEntry(Self.digestID, animated: animated)
+                if let last = rest.first { show(last) }
+            }
+            return
+        }
+        dropEntry(id, animated: animated)
+    }
+
+    private func dropEntry(_ id: String, animated: Bool) {
         guard let i = entries.firstIndex(where: { $0.id == id }) else { return }
         let entry = entries.remove(at: i)
         entry.timer?.invalidate()
@@ -330,9 +463,10 @@ final class BannerCenter {
         relayout(skipNewest: false)
     }
 
-    func removeAll() { entries.map(\.id).forEach { remove(id: $0, animated: false) } }
+    func removeAll() { entries.map(\.id).forEach { dropEntry($0, animated: false) } }
 
-    var visibleIDs: [String] { entries.map(\.id) }
+    /// The sessions on screen, the digest's included.
+    var visibleIDs: [String] { entries.flatMap { $0.sessions.map(\.id) } }
 
     /**
      Closes the banner after `seconds` of you being at the Mac. A banner that times out
