@@ -24,9 +24,9 @@ A seventh, Dip (two low marimba notes stepping down), plays when a turn fails.
 
 By default the Finished chime only plays when Claude worked for more than 30 seconds, so quick replies stay quiet. A prompt you leave unanswered gets one reminder after 5 minutes, and quiet hours can mute everything overnight.
 
-The menu bar lists the sessions waiting on you. Some need your input, with the question they're asking; others have finished and are ready for your reply. A badge next to the icon counts them, red when something needs you and gray when sessions are only waiting for a reply. Clicking a desktop-app chat opens it, and clicking a CLI session brings your terminal to the front.
+The menu bar lists the sessions waiting on you. Some need your input, with the question they're asking; others have finished and are ready for your reply. A badge next to the icon counts them, red when something needs you and gray when sessions are only waiting for a reply. Each row also shows how full that session's context is. Clicking a desktop-app chat opens it, and clicking a CLI session brings your terminal to the front.
 
-The menu also has volume and mute. It can also show a small on-screen banner when a session needs you or finishes, naming the session and what it's waiting for. Everything else lives in a Settings window, where you can pick each sound from the bundled chimes, your own files or the macOS sounds, preview it, and check that the setup is healthy. To add your own sounds, drop any `.wav`, `.aiff`, `.mp3`, `.m4a` or `.caf` file into `~/.claude/chimes/sounds`.
+The menu also has volume and mute. It can also show a small on-screen banner when a session needs you or finishes, naming the session and what it's waiting for. Everything else lives in a Settings window, where you can pick each sound from the bundled chimes, your own files or the macOS sounds, preview it, and check that the setup is healthy. To add your own sound, choose Add Sound… in any sound menu, or drop a `.wav`, `.aiff`, `.mp3`, `.m4a` or `.caf` file into `~/.claude/chimes/sounds`.
 
 The chimes play straight from the hooks, so they work even when the menu bar app isn't running.
 
@@ -39,6 +39,15 @@ If you use Claude Code on more than one Mac, turn on Other Macs. A session on on
 - To build from source: Xcode Command Line Tools, for `swiftc` and `python3` (`xcode-select --install`)
 
 ## Install
+
+### Homebrew
+
+```bash
+brew tap naumaanh/claude-chimes https://github.com/naumaanh/claude-chimes
+brew install --cask claude-chimes
+```
+
+Then open Claude Chimes and click Set Up. The cask skips the "can't verify the developer" stop, and `brew uninstall --cask claude-chimes` removes the hooks before the app.
 
 ### Download
 
@@ -146,6 +155,7 @@ Claude Code runs [hooks](https://docs.claude.com/en/docs/claude-code/hooks) on l
 | --- | --- | --- |
 | `UserPromptSubmit` | `prompt` | You sent a message, so the session is working and the turn's clock starts. Runs in the background. |
 | `Notification` | `notification` | Plays the Needs input chime and marks the session as needing you. Idle reminders are skipped. |
+| `PermissionRequest` | `permission` | A permission dialog opened. Plays the Needs input chime, unless `Notification` just did for the same prompt, and records what Claude is asking. Prints nothing, so it never answers the dialog. |
 | `PostToolUse` | `tool` | A tool ran, so a pending permission prompt was answered and the session is working again. Runs in the background. |
 | `Stop` | `stop` | Marks the session as ready for your reply, and plays the Finished chime if the turn ran longer than your threshold. |
 | `StopFailure` | `failure` | The turn ended with an error. Plays the Turn failed chime and marks the session as failed. |
@@ -171,7 +181,7 @@ Start with Settings → Health. From a terminal you can also run:
 
 If Other Macs doesn't find your other Mac, check that both Macs have it turned on, are on the same network, and are allowed under System Settings → Privacy & Security → Local Network. If the firewall is on, Claude Chimes must be allowed to accept incoming connections, under Network → Firewall → Options. Some office and guest networks block Bonjour between devices.
 
-If a session that was already open stays silent, restart it so it loads the hooks. If you moved the app, it relinks itself the next time it launches. If another tool rewrote `settings.json`, use Repair, which adds back only the Claude Chimes hooks.
+If a session that was already open stays silent, restart it so it loads the hooks. Settings → Health lists sessions that started before the hooks last changed. If you moved the app, it relinks itself the next time it launches. If another tool rewrote `settings.json`, use Repair, which adds back only the Claude Chimes hooks.
 
 To avoid hearing two sounds at once, turn off the desktop app's own notification sound: in the Claude desktop app, set Settings → Claude Code → Notification sound to None, or turn off "Play sound for notifications" under System Settings → Notifications → Claude. Banners still show. Leave your Mac's main volume alone, since the chimes play through it.
 
@@ -179,11 +189,13 @@ To avoid hearing two sounds at once, turn off the desktop app's own notification
 
 `tests/run.sh` builds the app into a throwaway home folder and checks setup, every hook event, session pruning, the health check, log rotation, Other Macs' message encryption and pairing math (in memory, with no network), and uninstall. It never touches your real `~/.claude` or the copy of the app you're running. CI runs it on every pull request. `ClaudeChimes --peer-loopback-test` pairs two copies in one process and syncs them over 127.0.0.1. It opens local sockets, so CI doesn't run it.
 
-To publish a release, bump `CFBundleShortVersionString` in `app/Info.plist`, add a section to [`CHANGELOG.md`](CHANGELOG.md), and push a matching tag such as `v1.4.0`. The release workflow tests, builds the universal app, and attaches the zip.
+To publish a release, bump `CFBundleShortVersionString` in `app/Info.plist` and `version` in `Casks/claude-chimes.rb`, add a section to [`CHANGELOG.md`](CHANGELOG.md), and push a matching tag such as `v1.4.0`. The release workflow tests, builds the universal app, and attaches the zip.
 
 ## Customizing
 
-To change the sounds, edit the notes, instruments and timing in [`sounds/generate.py`](sounds/generate.py), then run `python3 sounds/generate.py ~/.claude/chimes/sounds`.
+To use your own sound, choose Add Sound… at the bottom of any sound menu in Settings, or drop a file into `~/.claude/chimes/sounds`.
+
+To change the built-in sounds, edit the notes, instruments and timing in [`sounds/generate.py`](sounds/generate.py), then run `python3 sounds/generate.py ~/.claude/chimes/sounds`.
 
 To change the menu bar icon, replace [`assets/menubar.svg`](assets/menubar.svg) and `menubar-muted.svg` (18×18, black on transparent), then run `app/build.sh`.
 

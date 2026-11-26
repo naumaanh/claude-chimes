@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.8.0] - 2026-11-26
+
+### Added
+- Permission dialogs chime through Claude Code's `PermissionRequest` hook as well as `Notification`. In the Claude desktop app, `Notification` sometimes misses permission prompts; `PermissionRequest` fires for every one. When both fire for the same prompt, you hear one chime. The menu shows what Claude is asking, such as "Claude wants to run: npm test". The hook never answers the dialog.
+- Add Sound… at the bottom of each sound menu in Settings. It copies the file you choose into the sounds folder and uses it for that event.
+- Each session in the menu shows how full its context is, such as "182k context", read from the end of its transcript. Turn it off in Settings → Menu Bar.
+- Health warns about Claude sessions that started before Claude Chimes last changed its hooks. Claude Code reads hooks only when a session starts, so those sessions miss the new ones until you restart them.
+- Install with Homebrew: this repository is its own tap (see Install).
+
+### Changed
+- Setup keeps the five newest of its `settings.json` backups and deletes older ones. Backups made by other tools are left alone.
+
 ## [1.7.0] - 2026-11-06
 
 ### Added
