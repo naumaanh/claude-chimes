@@ -221,7 +221,9 @@ struct SessionState: Codable, Identifiable {
     var remotePeer: String?    // the paired Mac's peer ID
     var remoteHost: String?    // its name, for "on Mac mini"
     // Added in 1.8 (local only: Other Macs never sends it):
-    var reply: String? = nil   // the start of Claude's last reply, for the Finished banner
+    var reply: String? = nil   // the turn's recap, or the start of Claude's last reply, for the banner
+    var ask: String? = nil     // a question Claude left you at the end of the turn
+    var replyIsRecap: Bool? = nil
 
     var isFailed: Bool { failed == true }
     var isRemote: Bool { remotePeer != nil }
@@ -399,14 +401,25 @@ enum ContextUse {
 }
 
 /**
- The start of Claude's last reply, as plain text, for a banner: "Fixed the redirect. The
- login page now…". Markdown marks and code fences are dropped and runs of space folded,
- so two lines of a banner show words rather than syntax.
+ What a Finished banner says: a summary of the turn, and the question Claude left you, if any.
+
+ The Claude desktop app's Code tab ends each turn with a recap (what is now done, what is
+ still open) and sometimes one question, which it records in the transcript as a
+ `mcp__ccd_turn__wrap_up` tool call. That is the summary when it exists: instant and free.
+ Elsewhere (the CLI) it falls back to the start of the reply, with a closing question in
+ the reply pulled out on its own. Markdown is dropped and space folded either way.
  */
 enum ReplyPreview {
-    static let maxLength = 220
+    static let maxLength = 300
 
-    static func clean(_ text: String) -> String? {
+    struct Summary: Equatable {
+        var text: String?
+        var ask: String?
+        /// The text is Claude's own recap of the turn, not the start of its reply.
+        var isRecap = false
+    }
+
+    static func clean(_ text: String, max: Int = maxLength) -> String? {
         var t = text.replacingOccurrences(of: #"```[\s\S]*?```"#, with: " ", options: .regularExpression)
         t = t.replacingOccurrences(of: #"(?m)^\s{0,3}(#{1,6}|>|[-*+]|\d+\.)\s+"#, with: "", options: .regularExpression)
         t = t.replacingOccurrences(of: #"[*_`|]+"#, with: "", options: .regularExpression)
@@ -414,26 +427,79 @@ enum ReplyPreview {
         t = t.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespaces)
         guard !t.isEmpty else { return nil }
-        return t.count > maxLength ? String(t.prefix(maxLength - 1)) + "…" : t
+        return t.count > max ? String(t.prefix(max - 1)) + "…" : t
     }
 
-    /// From the Stop hook's payload when Claude Code sends the reply there, else from the
-    /// last assistant text in the transcript's tail.
-    static func from(payload: [String: Any], transcript: String?) -> String? {
-        if let text = payload["last_assistant_message"] as? String, let c = clean(text) { return c }
-        guard let transcript, let handle = FileHandle(forReadingAtPath: transcript) else { return nil }
+    /// A question the reply ends on, such as "Should I push the branch?", or nil.
+    static func closingQuestion(_ text: String) -> String? {
+        let paragraphs = text.components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard let last = paragraphs.last.flatMap({ clean($0, max: 160) }), last.hasSuffix("?") else { return nil }
+        // The last sentence only: "Done. Should I push it?" asks "Should I push it?".
+        let sentences = last.components(separatedBy: ". ")
+        return sentences.last.map { $0.hasSuffix("?") ? $0 : last }
+    }
+
+    static func from(payload: [String: Any], transcript: String?) -> Summary {
+        let tail = transcript.flatMap(readTail)
+        if let tail, let recap = recap(in: tail) { return recap }
+        let reply = (payload["last_assistant_message"] as? String) ?? tail.flatMap(lastReply)
+        guard let reply else { return Summary() }
+        let ask = closingQuestion(reply)
+        var body = reply
+        // Don't spend the preview's lines on the question it shows on its own line.
+        if let ask, let range = body.range(of: ask, options: .backwards) { body.removeSubrange(range) }
+        return Summary(text: clean(body), ask: ask)
+    }
+
+    // MARK: Reading the transcript
+
+    private static func readTail(_ path: String) -> [String]? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? handle.close() }
         let size = (try? handle.seekToEnd()) ?? 0
-        let window: UInt64 = 512 * 1024
+        let window: UInt64 = 1024 * 1024
         try? handle.seek(toOffset: size > window ? size - window : 0)
         guard let data = try? handle.readToEnd(), let text = String(data: data, encoding: .utf8) else { return nil }
-        for line in text.split(separator: "\n").reversed() where line.contains("\"assistant\"") {
-            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                  obj["type"] as? String == "assistant",
+        return text.split(separator: "\n").map(String.init)
+    }
+
+    private static func object(_ line: String) -> [String: Any]? {
+        try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+    }
+
+    /// A message you typed, which starts a turn. Tool results and injected notes are
+    /// "user" rows too, so they don't count.
+    private static func isPrompt(_ obj: [String: Any]) -> Bool {
+        guard obj["type"] as? String == "user", obj["isMeta"] as? Bool != true,
+              let content = (obj["message"] as? [String: Any])?["content"] else { return false }
+        if content is String { return true }
+        guard let blocks = content as? [[String: Any]] else { return false }
+        return blocks.contains { $0["type"] as? String == "text" } && !blocks.contains { $0["type"] as? String == "tool_result" }
+    }
+
+    /// The latest end-of-turn recap in this turn (after your last message), if any.
+    static func recap(in lines: [String]) -> Summary? {
+        for line in lines.reversed() {
+            if line.contains("\"user\""), let obj = object(line), isPrompt(obj) { return nil }
+            guard line.contains("mcp__ccd_turn__wrap_up"), let obj = object(line),
+                  let blocks = (obj["message"] as? [String: Any])?["content"] as? [[String: Any]] else { continue }
+            for block in blocks.reversed() where block["type"] as? String == "tool_use"
+                && (block["name"] as? String)?.hasSuffix("ccd_turn__wrap_up") == true {
+                let input = block["input"] as? [String: Any] ?? [:]
+                guard let recap = (input["recap"] as? String).flatMap({ clean($0) }) else { continue }
+                return Summary(text: recap, ask: (input["ask"] as? String).flatMap { clean($0, max: 160) }, isRecap: true)
+            }
+        }
+        return nil
+    }
+
+    private static func lastReply(_ lines: [String]) -> String? {
+        for line in lines.reversed() where line.contains("\"assistant\"") {
+            guard let obj = object(line), obj["type"] as? String == "assistant",
                   let blocks = (obj["message"] as? [String: Any])?["content"] as? [[String: Any]] else { continue }
             let joined = blocks.compactMap { $0["type"] as? String == "text" ? $0["text"] as? String : nil }
-                .joined(separator: " ")
-            if let c = clean(joined) { return c }
+                .joined(separator: "\n")
+            if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return joined }
         }
         return nil
     }
@@ -535,7 +601,7 @@ func runHook(_ event: String) -> Never {
 
     @discardableResult
     func record(_ status: SessionState.Status, message: String?, workingSince: Date? = nil,
-                turnSeconds: Double? = nil, failed: Bool = false, reply: String? = nil, note: String = "") -> SessionState? {
+                turnSeconds: Double? = nil, failed: Bool = false, summary: ReplyPreview.Summary? = nil, note: String = "") -> SessionState? {
         guard !id.isEmpty else { return nil }
         let previous = Sessions.read(id)
         let folder = URL(fileURLWithPath: cwd).lastPathComponent
@@ -549,7 +615,8 @@ func runHook(_ event: String) -> Never {
                              workingSince: workingSince, turnSeconds: turnSeconds, failed: failed ? true : nil,
                              transcriptPath: transcript ?? previous?.transcriptPath,
                              tty: pid.flatMap(ProcessCheck.tty) ?? previous?.tty,
-                             termProgram: env["TERM_PROGRAM"] ?? previous?.termProgram, reply: reply)
+                             termProgram: env["TERM_PROGRAM"] ?? previous?.termProgram,
+                             reply: summary?.text, ask: summary?.ask, replyIsRecap: summary?.isRecap == true ? true : nil)
         Sessions.write(s)
         EventLog.append("\(event) session=\(short) status=\(status.rawValue) title=\"\(title)\"\(note)")
         return s
@@ -605,7 +672,7 @@ func runHook(_ event: String) -> Never {
         let long = !config.isShortTurn(turn)
         let note = (turn.map { " turn=\(Int($0))s" } ?? "") + (long ? chime(config.done) : " chime=skipped-short-turn")
         record(.finished, message: nil, turnSeconds: turn,
-               reply: ReplyPreview.from(payload: payload, transcript: transcript), note: note)
+               summary: ReplyPreview.from(payload: payload, transcript: transcript), note: note)
     case "failure":
         // The turn ended with an error (Claude Code's StopFailure hook).
         let started = Sessions.read(id)?.workingSince
@@ -1448,7 +1515,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var done = SessionState(id: "test-banner-finished", status: .finished, title: "Sample: write the release notes",
                                 cwd: "/sample/api-server", message: nil, appBundleID: nil, updatedAt: Date())
         done.turnSeconds = 252
-        done.reply = "Done. The release notes are in CHANGELOG.md, with the new permission hook first and the Homebrew cask last. I left the screenshots alone."
+        done.reply = "The release notes are written in CHANGELOG.md, with the permission hook first and the Homebrew cask last. All tests pass. Nothing is pushed yet."
+        done.replyIsRecap = true
+        done.ask = "Push the branch and open a pull request?"
         banners.show(done)
         banners.show(SessionState(id: "test-banner-input", status: .needsInput, title: "Sample: fix the login redirect",
                                   cwd: "/sample/api-server", message: "Claude wants to run: npm test -- --grep \"login redirect\"",
@@ -1793,7 +1862,9 @@ if let i = args.firstIndex(of: "--snapshot-banner"), i + 1 < args.count {
         if args.contains("--remote") { s.remotePeer = "demo"; s.remoteHost = "Mac mini" }
         if finished {
             s.turnSeconds = 252
-            s.reply = ReplyPreview.clean("**Done.** The release notes for 1.8.0 are in `CHANGELOG.md`, with the new permission hook first and the Homebrew cask last. I left the screenshots alone.")
+            s.reply = "The release notes for 1.8.0 are written in CHANGELOG.md, with the permission hook first and the Homebrew cask last. All 75 tests pass. Nothing is pushed yet."
+            s.replyIsRecap = true
+            if !args.contains("--no-ask") { s.ask = "Push the branch and open a pull request?" }
         }
         if args.contains("--plain") { s.cwd = ""; s.reply = nil }
         let pad: CGFloat = 20

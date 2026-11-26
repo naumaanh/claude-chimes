@@ -18,9 +18,11 @@ final class BannerView: NSView {
     var onHoverChange: ((Bool) -> Void)?
 
     /**
-     The banner's lines, top to bottom: what happened, the session, what it is about (up to
-     two lines: the question, the command, the error, or the start of the reply), then small
-     facts (how long, how full the context is, which folder). The card is as tall as that.
+     The banner's lines, top to bottom: what happened, the session, what it is about (the
+     command or question it waits on, the error, or a summary of the turn: Claude's own recap
+     where the app wrote one, up to three lines, else the start of the reply), the question
+     Claude left you if any, then small facts (how long, how full the context is, which
+     folder). The card is as tall as that.
      */
     init(session s: SessionState, preview: Bool = true, onOpen: @escaping () -> Void, onDismiss: @escaping () -> Void) {
         self.onOpen = onOpen
@@ -29,12 +31,15 @@ final class BannerView: NSView {
         let body: String = needsInput ? (s.message ?? "Claude is waiting for you")
             : didFail ? (s.message ?? "Claude hit an error")
             : (preview ? s.reply : nil) ?? "Claude finished a reply"   // the time is in the facts line
+        // A question at the end of a turn is the thing to act on, so it gets its own line.
+        let ask = (!needsInput && !didFail && preview) ? s.ask : nil
         var facts: [String] = []
         if !needsInput, let t = s.turnSeconds { facts.append(BannerView.duration(t)) }
         if s.remoteHost == nil, let c = ContextUse.label(s.transcriptPath) { facts.append(c) }
         let folder = s.cwd.isEmpty ? "" : URL(fileURLWithPath: s.cwd).lastPathComponent
         if !folder.isEmpty, folder != "/", !s.title.localizedCaseInsensitiveContains(folder) { facts.append(folder) }
-        let layout = Layout(body: body, facts: facts.joined(separator: " · "))
+        let layout = Layout(body: body, ask: ask, facts: facts.joined(separator: " · "),
+                            maxLines: s.replyIsRecap == true && !needsInput ? 3 : 2)
         super.init(frame: NSRect(x: 0, y: 0, width: Self.width, height: layout.height))
         build(s, layout: layout, needs: needsInput, failed: didFail)
     }
@@ -42,8 +47,11 @@ final class BannerView: NSView {
     /// Where each line goes, measured before the view exists so the card can be sized to fit.
     struct Layout {
         let body: String
+        let ask: String?
         let facts: String
+        let maxLines: Int
         let bodyHeight: CGFloat
+        let askHeight: CGFloat
         let height: CGFloat
         static let textWidth: CGFloat = 270
         static let bodyFont = NSFont.systemFont(ofSize: 12.5)
@@ -68,16 +76,40 @@ final class BannerView: NSView {
             ])
         }
 
-        init(body: String, facts: String) {
+        static let askFont = NSFont.systemFont(ofSize: 12.5, weight: .medium)
+
+        /// The height of `lines` lines of body text, with the spacing between them.
+        static func height(lines: Int, font: NSFont) -> CGFloat {
+            let line = ceil(font.ascender - font.descender + font.leading) + 1
+            return line * CGFloat(lines) + lineSpacing * CGFloat(max(0, lines - 1))
+        }
+
+        static func lines(_ text: NSAttributedString, font: NSFont, max: Int) -> Int {
+            let line = ceil(font.ascender - font.descender + font.leading) + 1
+            let measured = text.boundingRect(with: NSSize(width: textWidth, height: 1000),
+                                             options: [.usesLineFragmentOrigin, .usesFontLeading]).height
+            return min(max, Swift.max(1, Int(((measured + lineSpacing) / (line + lineSpacing)).rounded(.up))))
+        }
+
+        init(body: String, ask: String?, facts: String, maxLines: Int = 2) {
             self.body = body
+            self.ask = ask
             self.facts = facts
-            let line = ceil(Self.bodyFont.ascender - Self.bodyFont.descender + Self.bodyFont.leading) + 1
-            let measured = Self.bodyText(body).boundingRect(
-                with: NSSize(width: Self.textWidth, height: 1000),
-                options: [.usesLineFragmentOrigin, .usesFontLeading]).height
-            bodyHeight = measured > line * 1.5 ? line * 2 + Self.lineSpacing : line
-            // 8 top, caption 14, title 17, body, facts 13 with a 6 pt gap, 9 bottom.
-            height = 8 + 14 + 18 + bodyHeight + (facts.isEmpty ? 0 : 20) + 9
+            self.maxLines = maxLines
+            bodyHeight = Self.height(lines: Self.lines(Self.bodyText(body), font: Self.bodyFont, max: maxLines), font: Self.bodyFont)
+            askHeight = ask.map { Self.height(lines: Self.lines(Self.askText($0), font: Self.askFont, max: 2), font: Self.askFont) + 4 } ?? 0
+            // 8 top, caption 14, title 17, body, the question, facts 13 with a 6 pt gap, 9 bottom.
+            height = 8 + 14 + 18 + bodyHeight + askHeight + (facts.isEmpty ? 0 : 20) + 9
+        }
+
+        /// The question Claude left you, in the accent color: the one thing to do next.
+        static func askText(_ ask: String) -> NSAttributedString {
+            let style = NSMutableParagraphStyle()
+            style.lineSpacing = lineSpacing
+            style.lineBreakMode = .byWordWrapping
+            return NSAttributedString(string: ask, attributes: [
+                .font: askFont, .foregroundColor: NSColor.controlAccentColor, .paragraphStyle: style,
+            ])
         }
     }
 
@@ -110,10 +142,12 @@ final class BannerView: NSView {
                                 : failed ? "exclamationmark.triangle.fill" : "checkmark.bubble.fill",
                              accessibilityDescription: nil)
         icon.symbolConfiguration = .init(pointSize: 17, weight: .regular)
-        let tint: NSColor = needs ? .systemRed : failed ? .systemOrange : .secondaryLabelColor
+        let asks = layout.ask != nil
+        let tint: NSColor = needs ? .systemRed : failed ? .systemOrange : asks ? .controlAccentColor : .secondaryLabelColor
         icon.contentTintColor = tint
+        if asks { icon.image = NSImage(systemSymbolName: "questionmark.bubble.fill", accessibilityDescription: nil) }
 
-        let what = needs ? "Needs your input" : failed ? "Turn failed" : "Ready for your reply"
+        let what = needs ? "Needs your input" : failed ? "Turn failed" : asks ? "Waiting on your answer" : "Ready for your reply"
         let caption = NSTextField(labelWithString: s.remoteHost.map { "\(what) · on \($0)" } ?? what)
         caption.lineBreakMode = .byTruncatingTail
         caption.font = .systemFont(ofSize: 11, weight: .medium)
@@ -127,11 +161,20 @@ final class BannerView: NSView {
 
         let detail = NSTextField(wrappingLabelWithString: layout.body)
         detail.attributedStringValue = Layout.bodyText(layout.body)
-        detail.maximumNumberOfLines = 2
+        detail.maximumNumberOfLines = layout.maxLines
         // Word wrap with the last line cut: truncating-tail mode would hold it to one line.
         detail.lineBreakMode = .byWordWrapping
         detail.cell?.truncatesLastVisibleLine = true
         detail.frame = NSRect(x: 46, y: height - 8 - 14 - 18 - layout.bodyHeight, width: Layout.textWidth, height: layout.bodyHeight)
+
+        let question = NSTextField(wrappingLabelWithString: layout.ask ?? "")
+        question.attributedStringValue = Layout.askText(layout.ask ?? "")
+        question.maximumNumberOfLines = 2
+        question.lineBreakMode = .byWordWrapping
+        question.cell?.truncatesLastVisibleLine = true
+        question.frame = NSRect(x: 46, y: detail.frame.minY - layout.askHeight,
+                                width: Layout.textWidth, height: max(0, layout.askHeight - 4))
+        question.isHidden = layout.ask == nil
 
         let facts = NSTextField(labelWithString: layout.facts)
         facts.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
@@ -151,11 +194,12 @@ final class BannerView: NSView {
         close.action = #selector(closeTapped)
         close.toolTip = "Dismiss (done with this session)"
 
-        [icon, caption, title, detail, facts, close].forEach(addSubview)
+        [icon, caption, title, detail, question, facts, close].forEach(addSubview)
 
         setAccessibilityElement(true)
         setAccessibilityRole(.button)
-        setAccessibilityLabel("\(caption.stringValue): \(s.title). \(layout.body)" + (layout.facts.isEmpty ? "" : ". \(layout.facts)"))
+        setAccessibilityLabel("\(caption.stringValue): \(s.title). \(layout.body)" + (layout.ask.map { " \($0)" } ?? "")
+                              + (layout.facts.isEmpty ? "" : ". \(layout.facts)"))
         setAccessibilityCustomActions([NSAccessibilityCustomAction(name: "Dismiss") { [weak self] in
             self?.onDismiss(); return true
         }])

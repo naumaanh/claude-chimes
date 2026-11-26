@@ -195,6 +195,23 @@ echo '{"session_id":"r2","cwd":"/tmp/r2","last_assistant_message":"All 40 tests 
 check "the reply in the Stop payload is used when there is one" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"reply\"]==\"All 40 tests pass.\"" "$SESSIONS/r2.json"'
 check "the reply is never sent to other Macs" '! grep -q "\"reply\"" "$ROOT/app/Sources/Peers.swift"'
 rm -f "$SESSIONS"/r1.json "$SESSIONS"/r2.json
+W="$WORK/w.jsonl"
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"first task"}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__ccd_turn__wrap_up","input":{"recap":"Old turn recap."}}]}}' \
+  '{"type":"user","message":{"role":"user","content":"fix the banner"}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]}}' \
+  '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"ok"}]}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__ccd_turn__wrap_up","input":{"recap":"The banner shows the **recap** now. Nothing is pushed.","ask":"Push the branch?"}}]}}' \
+  '{"type":"assistant","message":{"content":[{"type":"text","text":"Long reply that should not be shown."}]}}' > "$W"
+echo "{\"session_id\":\"w1\",\"cwd\":\"/tmp/w1\",\"transcript_path\":\"$W\"}" | lim "$HOOK" stop
+check "the turn's own recap is the summary" 'python3 -c "import json,sys; s=json.load(open(sys.argv[1])); assert s[\"reply\"]==\"The banner shows the recap now. Nothing is pushed.\" and s[\"replyIsRecap\"], s" "$SESSIONS/w1.json"'
+check "the recap's question is kept apart" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"ask\"]==\"Push the branch?\"" "$SESSIONS/w1.json"'
+head -2 "$W" > "$WORK/w2.jsonl"; printf '%s\n' '{"type":"user","message":{"role":"user","content":"next"}}' \
+  '{"type":"assistant","message":{"content":[{"type":"text","text":"Renamed the file.\n\nShould I commit it?"}]}}' >> "$WORK/w2.jsonl"
+echo "{\"session_id\":\"w2\",\"cwd\":\"/tmp/w2\",\"transcript_path\":\"$WORK/w2.jsonl\"}" | lim "$HOOK" stop
+check "an earlier turn's recap is never used" 'python3 -c "import json,sys; s=json.load(open(sys.argv[1])); assert s[\"reply\"]==\"Renamed the file.\" and not s.get(\"replyIsRecap\"), s" "$SESSIONS/w2.json"'
+check "without a recap, a closing question is pulled out" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"ask\"]==\"Should I commit it?\"" "$SESSIONS/w2.json"'
+rm -f "$SESSIONS"/w1.json "$SESSIONS"/w2.json
 
 section "Adding your own sounds"
 mkdir -p "$WORK/mine" "$WORK/other"
