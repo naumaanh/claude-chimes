@@ -72,6 +72,9 @@ check "a Notification for the same prompt doesn't chime again" 'lastlog | grep -
 check "it keeps the more specific permission message" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"message\"]==\"Claude wants to run: npm test\"" "$SESSIONS/p1.json"'
 echo '{"session_id":"p1","cwd":"/tmp/p1","tool_name":"Bash","tool_input":{"command":"git clean -fd"}}' | lim "$HOOK" permission
 check "a new prompt right after a denied one still chimes" 'lastlog | grep -q "permission session=p1.*chime=played"'
+echo '{"session_id":"p1","cwd":"/tmp/p1","notification_type":"elicitation_dialog","message":"Claude has a question"}' | lim "$HOOK" notification
+check "a question right after a permission prompt still chimes" 'lastlog | grep -q "notification session=p1.*chime=played"'
+check "session files are readable by this account only" '[ "$(stat -f %Lp "$SESSIONS/p1.json")" = 600 ] && [ "$(stat -f %Lp "$SESSIONS")" = 700 ] && [ "$(stat -f %Lp "$HOME/.claude/chimes")" = 700 ]'
 hook s1 tool
 check "a tool run returns it to working" '[ "$(status_of s1)" = working ]'
 hook s1 stop CLAUDE_CODE_ENTRYPOINT=cli

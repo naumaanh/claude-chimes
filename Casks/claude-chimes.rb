@@ -19,17 +19,17 @@ cask "claude-chimes" do
 
   app "Claude Chimes.app"
 
-  # The app isn't notarized. Installing it this way is the person choosing it, so skip the
-  # "can't verify the developer" stop that a download would hit.
-  postflight do
-    system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{appdir}/Claude Chimes.app"]
-  end
+  # Quarantine is left on: the zip has no pinned checksum, so Gatekeeper's check is the one
+  # check left. The first launch asks once (Privacy & Security → Open Anyway), as a download does.
 
   # No uninstall step that removes the hooks: Homebrew runs uninstall steps on every
   # `brew upgrade` too, and the new version only restores hooks when some are still there,
   # so upgrading would silence it for good. The hooks point at the app's own path, which
   # an upgrade keeps.
   caveats <<~EOS
+    Claude Chimes isn't notarized, so the first time it opens macOS asks once: open
+    System Settings → Privacy & Security and click Open Anyway.
+
     To remove Claude Chimes completely, first use Settings → Uninstall in the app (it takes
     its hooks out of ~/.claude/settings.json), then run `brew uninstall --cask claude-chimes`.
   EOS

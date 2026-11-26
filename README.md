@@ -47,7 +47,7 @@ brew tap naumaanh/claude-chimes https://github.com/naumaanh/claude-chimes
 brew install --cask claude-chimes
 ```
 
-Then open Claude Chimes and click Set Up. The cask skips the "can't verify the developer" stop. To remove it, use Settings → Uninstall first, then `brew uninstall --cask claude-chimes`; `brew upgrade` keeps your hooks.
+Then open Claude Chimes. The first time, macOS says it can't verify the developer: open System Settings → Privacy & Security and click Open Anyway, once. Then click Set Up. To remove it, use Settings → Uninstall first, then `brew uninstall --cask claude-chimes`; `brew upgrade` keeps your hooks.
 
 ### Download
 

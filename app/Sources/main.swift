@@ -302,11 +302,16 @@ enum ProcessCheck {
             let name = withUnsafeBytes(of: p.kp_proc.p_comm) { raw in
                 String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
             }
-            guard name == processName else { continue }
+            guard name == processName || (processName == "claude" && name == "node" && isClaudeNode(p.kp_proc.p_pid)) else { continue }
             let tv = p.kp_proc.p_starttime
             out[p.kp_proc.p_pid] = Double(tv.tv_sec) + Double(tv.tv_usec) / 1_000_000
         }
         return out
+    }
+
+    /// Claude Code installed with npm runs as `node …/@anthropic-ai/claude-code/cli.js`.
+    static func isClaudeNode(_ pid: Int32) -> Bool {
+        arguments(pid).dropFirst().first.map { $0.contains("@anthropic-ai/claude-code") || $0.hasSuffix("/bin/claude") } ?? false
     }
 
     /// A process's arguments (argv), or [] when they can't be read.
@@ -359,9 +364,18 @@ enum Sessions {
         return try? decoder.decode(SessionState.self, from: d)
     }
 
+    /// Session files hold message text and, since 1.8, the start of Claude's replies. The
+    /// home folder lets other accounts in the staff group look inside, so the chimes folder
+    /// and the files are this account's alone.
     static func write(_ s: SessionState) {
-        try? FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
-        if let d = try? encoder.encode(s) { try? d.write(to: url(s.id), options: .atomic) }
+        let fm = FileManager.default
+        try? fm.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+        for dir in [chimesDir, sessionsDir] { try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path) }
+        guard let d = try? encoder.encode(s) else { return }
+        let target = url(s.id)
+        if (try? d.write(to: target, options: .atomic)) != nil {
+            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+        }
     }
 
     static func remove(_ id: String) { try? FileManager.default.removeItem(at: url(id)) }
@@ -715,7 +729,9 @@ func runHook(_ event: String) -> Never {
         // PermissionRequest may have chimed for this same prompt a moment ago. Then keep its
         // message ("Claude wants to run: npm test"), which says more than this one's.
         let prev = Sessions.read(id)
-        let (same, via) = samePrompt(prev)
+        // Only a permission prompt can be the same dialog PermissionRequest reported; any
+        // other notification (a question, say) is its own prompt.
+        let (same, via) = type == "permission_prompt" ? samePrompt(prev) : (false, [event])
         let message = same && via.contains("permission") ? prev?.message : payload["message"] as? String
         record(.needsInput, message: message, workingSince: prev?.workingSince, askedVia: via,
                note: same ? " chime=already-asked" : chime(config.input))

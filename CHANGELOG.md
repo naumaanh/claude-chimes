@@ -8,6 +8,7 @@
 - Each session in the menu shows how full its context is, such as "182k context", read from the end of its transcript. Turn it off in Settings → Menu Bar.
 - Health warns about Claude sessions that started before Claude Chimes last changed its hooks. Claude Code reads hooks only when a session starts, so those sessions miss the new ones until you restart them.
 - Install with Homebrew: this repository is its own tap (see Install).
+- Session files and the `~/.claude/chimes` folder are now readable by your account only, since they can hold the start of Claude's replies.
 - Richer banners. A Finished banner summarizes the turn: in the Claude desktop app's Code tab it shows Claude's own end-of-turn recap (what is done, what is still open), up to three lines, and any question Claude left you on its own line, in the accent color, under "Waiting on your answer". Elsewhere it shows the start of the reply, with a closing question pulled out the same way. A Needs input banner shows the whole question or command. A small line underneath gives how long the turn took, how full the context is, and the project folder. Banners grow to fit, and stacked banners still line up. Settings → Banners → "Preview Claude's reply in banners" turns the reply off, for screen sharing. Replies are never sent to other Macs.
 
 ### Changed
