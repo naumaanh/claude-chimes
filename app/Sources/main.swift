@@ -1238,7 +1238,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         banners.config = { [weak self] in self?.model.config ?? Config.load() }
         banners.onOpen = { [weak self] s in self?.open(s) }
-        banners.onDismiss = { [weak self] s in if s.id != "test-banner" { self?.dismiss(s, in: nil) } }
+        banners.onDismiss = { [weak self] s in if !s.id.hasPrefix("test-banner") { self?.dismiss(s, in: nil) } }
         model.onTestBanner = { [weak self] in self?.showTestBanner() }
         model.peers.onRemote = { [weak self] peer, list, baseline in self?.model.setRemote(peer, list, baseline: baseline) }
         model.peers.onRemoteGone = { [weak self] peer in self?.model.removeRemote(peer) }
@@ -1414,7 +1414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if wanted { banners.show(s) } else { banners.remove(id: s.id, animated: true) }
         }
         let alive = Set(new.map(\.id))
-        for id in banners.visibleIDs where !alive.contains(id) && id != "test-banner" { banners.remove(id: id, animated: true) }
+        for id in banners.visibleIDs where !alive.contains(id) && !id.hasPrefix("test-banner") { banners.remove(id: id, animated: true) }
     }
 
     /// This Mac's hook chimes for its own sessions. Sessions from another Mac chime here, by this Mac's settings.
@@ -1442,10 +1442,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// A sample banner for Settings → Banners → Show Test Banner.
+    /// Two sample banners for Settings → Banners → Show Test Banner: one of each kind, with
+    /// every line filled in, so the setting's effect (and the stacking) can be seen at once.
     func showTestBanner() {
-        banners.show(SessionState(id: "test-banner", status: .needsInput, title: "Test banner from Claude Chimes",
-                                  cwd: "", message: "This is what a banner looks like", appBundleID: nil, updatedAt: Date()))
+        var done = SessionState(id: "test-banner-finished", status: .finished, title: "Sample: write the release notes",
+                                cwd: "/sample/api-server", message: nil, appBundleID: nil, updatedAt: Date())
+        done.turnSeconds = 252
+        done.reply = "Done. The release notes are in CHANGELOG.md, with the new permission hook first and the Homebrew cask last. I left the screenshots alone."
+        banners.show(done)
+        banners.show(SessionState(id: "test-banner-input", status: .needsInput, title: "Sample: fix the login redirect",
+                                  cwd: "/sample/api-server", message: "Claude wants to run: npm test -- --grep \"login redirect\"",
+                                  appBundleID: nil, updatedAt: Date()))
     }
 
     func dismiss(_ s: SessionState, in menu: NSMenu?) {
