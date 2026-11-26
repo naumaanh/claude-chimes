@@ -272,6 +272,32 @@ enum ProcessCheck {
         return s.hasPrefix("tty") ? "/dev/" + s : nil
     }
 
+    /// Start times of this user's running Claude Code processes, by PID. Found by process
+    /// name, so it sees sessions whether or not any hook has run in them yet.
+    /// The process name to look for. The tests point it at a stand-in so the
+    /// Claude sessions running on the machine don't affect them.
+    static let processName = ProcessInfo.processInfo.environment["CLAUDE_CHIMES_PROCESS_NAME"] ?? "claude"
+
+    static func claudeProcesses() -> [Int32: Double] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_UID, Int32(getuid())]
+        var size = 0
+        guard sysctl(&mib, 4, nil, &size, nil, 0) == 0, size > 0 else { return [:] }
+        let count = size / MemoryLayout<kinfo_proc>.stride + 16   // room for processes started meanwhile
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: count)
+        size = count * MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&mib, 4, &procs, &size, nil, 0) == 0 else { return [:] }
+        var out: [Int32: Double] = [:]
+        for p in procs.prefix(size / MemoryLayout<kinfo_proc>.stride) {
+            let name = withUnsafeBytes(of: p.kp_proc.p_comm) { raw in
+                String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+            }
+            guard name == processName else { continue }
+            let tv = p.kp_proc.p_starttime
+            out[p.kp_proc.p_pid] = Double(tv.tv_sec) + Double(tv.tv_usec) / 1_000_000
+        }
+        return out
+    }
+
     static func isAlive(pid: Int32, startedAt: Double?) -> Bool {
         guard let now = startTime(pid) else { return false }
         guard let startedAt else { return true }
@@ -547,6 +573,15 @@ enum Health {
             out.append(missing.isEmpty
                 ? .init(id: "hooks", level: .ok, title: "Claude Code hooks", detail: "All \(Installer.wanted.count) hooks are installed.")
                 : .init(id: "hooks", level: .fail, title: "Claude Code hooks", detail: "Missing: \(missing.joined(separator: ", ")). Repair adds them back."))
+        }
+
+        // Found by process, not by hook: a session that started before the hooks changed
+        // never runs the new ones, so it can't report itself.
+        let old = Installer.sessionsOnOldHooks()
+        if !old.isEmpty {
+            let n = old.count == 1 ? "1 Claude session" : "\(old.count) Claude sessions"
+            out.append(.init(id: "old-hooks", level: .warn, title: "Sessions on older hooks",
+                             detail: "\(n) started before Claude Chimes last updated its hooks, so \(old.count == 1 ? "it keeps" : "they keep") the old ones until restarted. Quit and reopen \(old.count == 1 ? "it" : "them") to get every chime."))
         }
 
         let target = (try? FileManager.default.destinationOfSymbolicLink(atPath: hookLink.path))

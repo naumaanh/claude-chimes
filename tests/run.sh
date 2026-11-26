@@ -159,6 +159,22 @@ check "Other Macs setting is read from config" 'lim "$BIN" --doctor </dev/null |
 sed -i '' '/^otherMacs=/d' "$HOME/.claude/chimes/config"
 check "the hook never creates peers.json" '[ ! -e "$HOME/.claude/chimes/peers.json" ]'
 
+section "Sessions on older hooks"
+export CLAUDE_CHIMES_PROCESS_NAME=chimes-stand-in
+# A real program with its own name: a copied system binary is killed by code signing,
+# and a symlink reports the name of what it points at.
+printf '#include <unistd.h>\nint main(void) { sleep(60); return 0; }\n' | cc -x c - -o "$WORK/chimes-stand-in"
+"$WORK/chimes-stand-in" & OLD=$!
+sleep 1.5
+lim "$BIN" --uninstall </dev/null >/dev/null; lim "$BIN" --setup </dev/null >/dev/null
+check "setup records when it wrote the hooks" '[ -s "$HOME/.claude/chimes/hooks-written" ]'
+check "a session started before that is flagged" 'lim "$HOOK" --doctor </dev/null | grep -q "1 Claude session started before"'
+kill $OLD 2>/dev/null; wait $OLD 2>/dev/null
+"$WORK/chimes-stand-in" & NEW=$!
+check "a session started after it is not" '! lim "$HOOK" --doctor </dev/null | grep -q "started before Claude Chimes"'
+kill $NEW 2>/dev/null; wait $NEW 2>/dev/null
+unset CLAUDE_CHIMES_PROCESS_NAME
+
 section "Adding your own sounds"
 mkdir -p "$WORK/mine" "$WORK/other"
 cp "$HOME/.claude/chimes/sounds/input-nudge.wav" "$WORK/mine/Ding.wav"

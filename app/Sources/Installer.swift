@@ -125,6 +125,25 @@ enum Installer {
         }
     }
 
+    /// When Claude Chimes last changed its hooks. Claude Code reads hooks when a session
+    /// starts, so any session older than this still runs the hooks it started with.
+    static let hooksWrittenURL = chimesDir.appendingPathComponent("hooks-written")
+
+    static func markHooksWritten() {
+        try? FileManager.default.createDirectory(at: chimesDir, withIntermediateDirectories: true)
+        try? String(Date().timeIntervalSince1970).write(to: hooksWrittenURL, atomically: true, encoding: .utf8)
+    }
+
+    static var hooksWrittenAt: Double? {
+        (try? String(contentsOf: hooksWrittenURL, encoding: .utf8)).flatMap { Double($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+    }
+
+    /// Running Claude Code sessions that started before the hooks were last written.
+    static func sessionsOnOldHooks() -> [Int32] {
+        guard let written = hooksWrittenAt else { return [] }
+        return ProcessCheck.claudeProcesses().filter { $0.value < written - 1 }.map(\.key).sorted()
+    }
+
     // MARK: Files
 
     /// Copies the bundled chimes into ~/.claude/chimes/sounds, skipping any that are already there.
@@ -162,7 +181,10 @@ enum Installer {
         if !FileManager.default.fileExists(atPath: configURL.path) { Config().save() }
         try link()
         let edited = editedHooks(settings, install: true)
-        if edited != settings { try writeSettings(edited) }   // no rewrite (or backup) when already set up
+        if edited != settings {   // no rewrite (or backup) when already set up
+            try writeSettings(edited)
+            markHooksWritten()
+        }
         EventLog.append("setup hooks-written sounds-copied=\(copied) link=\(appBinary?.path ?? "-")")
     }
 
