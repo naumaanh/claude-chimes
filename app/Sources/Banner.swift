@@ -218,6 +218,9 @@ final class BannerView: NSView {
         for (line, h) in zip(card.lines, heights) {
             y -= Self.gap(before: line.style) + h
             let field = NSTextField(wrappingLabelWithString: line.text)
+            // A wrapping label is selectable by default, and a selectable field takes the
+            // click: the text went into edit mode and the banner never opened.
+            field.isSelectable = false
             field.attributedStringValue = Self.text(line)
             field.maximumNumberOfLines = line.maxLines
             // Word wrap with the last line cut: truncating-tail mode would hold it to one line.
@@ -302,6 +305,18 @@ final class BannerView: NSView {
     override func mouseEntered(with event: NSEvent) { onHoverChange?(true) }
     override func mouseExited(with event: NSEvent) { onHoverChange?(false) }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// The whole card is one button, except its own buttons (×, Allow once, Deny): text,
+    /// icon and glass never swallow a click.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let hit = super.hitTest(point) else { return nil }
+        var view: NSView? = hit
+        while let v = view, v !== self {
+            if v is NSButton { return v }
+            view = v.superview
+        }
+        return frame.contains(point) ? self : hit
+    }
 
     override func mouseUp(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)

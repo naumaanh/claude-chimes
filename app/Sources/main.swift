@@ -1998,6 +1998,38 @@ if args.contains("--uninstall") {
     catch { FileHandle.standardError.write(Data("Uninstall failed: \(error.localizedDescription)\n".utf8)); exit(1) }
     exit(0)
 }
+// `--check-banner-clicks` builds sample banners and checks where clicks land: anywhere on the
+// card but its buttons must reach the card (which opens the session), never the text.
+if args.contains("--check-banner-clicks") {
+    MainActor.assumeIsolated {
+        _ = NSApplication.shared
+        var s = SessionState(id: "c", status: .finished, title: "Sample", cwd: "/x/api", message: nil, appBundleID: nil, updatedAt: Date())
+        s.reply = "The banner opens the session when you click it. Nothing else changed."
+        s.ask = "Push the branch?"
+        s.receipt = "Edited 2 files · tests passed"
+        let banner = BannerView(session: s, onOpen: {}, onDismiss: {})
+        var p = s; p.status = .needsInput; p.message = "Claude wants to run: npm test"; p.askedVia = ["permission"]; p.decisionToken = "t"
+        let permission = BannerView(session: p, onOpen: {}, onDismiss: {})
+        var failures: [String] = []
+        for (name, view) in [("finished", banner), ("permission", permission)] {
+            let host = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            host.addSubview(view)
+            for field in view.subviews.compactMap({ $0 as? NSTextField }) where field.isSelectable || field.isEditable {
+                failures.append("\(name): selectable text \"\(field.stringValue.prefix(30))\"")
+            }
+            for sub in view.subviews where !(sub is NSButton) && !(sub is NSVisualEffectView) {
+                let point = NSPoint(x: sub.frame.midX, y: sub.frame.midY)
+                if view.hitTest(point) !== view { failures.append("\(name): a click on \(type(of: sub)) misses the card") }
+            }
+            for button in view.subviews.compactMap({ $0 as? NSButton }) {
+                let point = NSPoint(x: button.frame.midX, y: button.frame.midY)
+                if view.hitTest(point) !== button { failures.append("\(name): \(button.title.isEmpty ? "close" : button.title) can't be clicked") }
+            }
+        }
+        if failures.isEmpty { print("ok") } else { print(failures.joined(separator: "\n")); exit(1) }
+    }
+    exit(0)
+}
 // `--context <transcript.jsonl>` prints what a session row would say about its context.
 if let i = args.firstIndex(of: "--context") {
     print(i + 1 < args.count ? (ContextUse.label(args[i + 1]) ?? "unknown") : "unknown")

@@ -233,6 +233,9 @@ check "a notice the app injects doesn't hide the turn's recap" 'python3 -c "impo
 check "without a recap, a closing question is pulled out" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"ask\"]==\"Should I commit it?\"" "$SESSIONS/w2.json"'
 rm -f "$SESSIONS"/w1.json "$SESSIONS"/w2.json "$SESSIONS"/w3.json "$SESSIONS"/w4.json
 
+section "Banner clicks"
+check "a click anywhere on a banner but its buttons opens the session" 'lim "$BIN" --check-banner-clicks </dev/null | grep -qx ok'
+
 section "Work receipts"
 K="$WORK/k.jsonl"
 cat > "$K" <<'JSONL'
