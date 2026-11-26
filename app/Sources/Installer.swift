@@ -125,6 +125,18 @@ enum Installer {
         }
     }
 
+    /// Makes ~/.claude/chimes, its sessions and the session files this account's alone.
+    /// New files are written that way; this brings older installs' files in line too.
+    static func makePrivate() {
+        let fm = FileManager.default
+        for dir in [chimesDir, sessionsDir] where fm.fileExists(atPath: dir.path) {
+            try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+        }
+        for name in (try? fm.contentsOfDirectory(atPath: sessionsDir.path)) ?? [] where name.hasSuffix(".json") {
+            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: sessionsDir.appendingPathComponent(name).path)
+        }
+    }
+
     /// When Claude Chimes last changed its hooks. Claude Code reads hooks when a session
     /// starts, so any session older than this still runs the hooks it started with.
     static let hooksWrittenURL = chimesDir.appendingPathComponent("hooks-written")
@@ -179,6 +191,7 @@ enum Installer {
         case .failure(let e): throw InstallError(message: e.message + ". Fix the file by hand, then try again.")
         }
         let copied = seedSounds()
+        makePrivate()
         if !FileManager.default.fileExists(atPath: configURL.path) { Config().save() }
         try link()
         let edited = editedHooks(settings, install: true)

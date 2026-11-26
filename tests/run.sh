@@ -51,6 +51,10 @@ check "background hooks are async" '[ "$(grep -c "\"async\": true" "$SETTINGS")"
 check "chimes copied to ~/.claude/chimes/sounds" '[ "$(ls "$HOME/.claude/chimes/sounds" | wc -l | tr -d " ")" = 7 ]'
 cp "$SETTINGS" "$WORK/after-setup.json"
 lim "$BIN" --setup </dev/null >/dev/null
+mkdir -p "$HOME/.claude/chimes/sessions"; echo '{}' > "$HOME/.claude/chimes/sessions/old.json"; chmod 644 "$HOME/.claude/chimes/sessions/old.json"; chmod 755 "$HOME/.claude/chimes/sessions" "$HOME/.claude/chimes"
+lim "$BIN" --setup </dev/null >/dev/null
+check "setup makes an older install's session files private" '[ "$(stat -f %Lp "$HOME/.claude/chimes/sessions/old.json")" = 600 ] && [ "$(stat -f %Lp "$HOME/.claude/chimes")" = 700 ]'
+rm -f "$HOME/.claude/chimes/sessions/old.json"
 check "running setup again changes nothing" 'cmp -s "$SETTINGS" "$WORK/after-setup.json"'
 check "doctor passes" 'lim "$HOOK" --doctor </dev/null >/dev/null'
 

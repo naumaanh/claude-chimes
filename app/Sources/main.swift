@@ -1402,6 +1402,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         model.onSessionsChanged = { [weak self] old, new in self?.sessionsChanged(old: old, new: new) }
         Health.relinkIfNeeded()
         Installer.upgradeIfNeeded()
+        Installer.makePrivate()
         if Welcome.shouldShow { showWelcome() }
         watchSessions()
         model.reloadSessions()
