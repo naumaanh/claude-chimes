@@ -9,7 +9,7 @@ import AppKit
 
 /// The card's contents. Also used by --snapshot-banner.
 final class BannerView: NSView {
-    static let width: CGFloat = 340
+    static let width: CGFloat = 360
     /// The height a banner had before 1.8, and still has with nothing extra to say.
     static let size = NSSize(width: width, height: 66)
 
@@ -45,20 +45,39 @@ final class BannerView: NSView {
         let facts: String
         let bodyHeight: CGFloat
         let height: CGFloat
-        static let textWidth: CGFloat = 250
-        static let bodyFont = NSFont.systemFont(ofSize: 12)
+        static let textWidth: CGFloat = 270
+        static let bodyFont = NSFont.systemFont(ofSize: 12.5)
+        static let lineSpacing: CGFloat = 2
+        /// Near-black in light mode, near-white in dark. Built per appearance, because a
+        /// system color with an alpha applied is fixed to whichever appearance was current.
+        static let bodyColor = NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                ? NSColor(white: 1, alpha: 0.85) : NSColor(white: 0, alpha: 0.8)
+        }
+
+        /// The body's text, near-black and with a little air between its two lines: it is
+        /// the line that says whether to look now, so it reads first after the title.
+        static func bodyText(_ body: String) -> NSAttributedString {
+            let style = NSMutableParagraphStyle()
+            style.lineSpacing = lineSpacing
+            style.lineBreakMode = .byWordWrapping
+            return NSAttributedString(string: body, attributes: [
+                .font: bodyFont,
+                .foregroundColor: bodyColor,
+                .paragraphStyle: style,
+            ])
+        }
 
         init(body: String, facts: String) {
             self.body = body
             self.facts = facts
             let line = ceil(Self.bodyFont.ascender - Self.bodyFont.descender + Self.bodyFont.leading) + 1
-            let measured = (body as NSString).boundingRect(
+            let measured = Self.bodyText(body).boundingRect(
                 with: NSSize(width: Self.textWidth, height: 1000),
-                options: [.usesLineFragmentOrigin, .usesFontLeading],
-                attributes: [.font: Self.bodyFont]).height
-            bodyHeight = measured > line * 1.5 ? line * 2 : line
+                options: [.usesLineFragmentOrigin, .usesFontLeading]).height
+            bodyHeight = measured > line * 1.5 ? line * 2 + Self.lineSpacing : line
             // 8 top, caption 14, title 17, body, facts 13 with a 6 pt gap, 9 bottom.
-            height = 8 + 14 + 18 + bodyHeight + (facts.isEmpty ? 0 : 19) + 9
+            height = 8 + 14 + 18 + bodyHeight + (facts.isEmpty ? 0 : 20) + 9
         }
     }
 
@@ -76,6 +95,14 @@ final class BannerView: NSView {
         blur.layer?.borderColor = NSColor.separatorColor.cgColor
         blur.autoresizingMask = [.width, .height]
         addSubview(blur)
+
+        // The glass alone lets a busy window behind show through the text. A partly opaque
+        // wash in the window color keeps the material's look but steadies the contrast.
+        backing.frame = blur.bounds
+        backing.autoresizingMask = [.width, .height]
+        backing.wantsLayer = true
+        blur.addSubview(backing)
+        updateBacking()
 
         // The icon sits beside the caption and title, where the eye starts, not mid-card.
         let icon = NSImageView(frame: NSRect(x: 14, y: height - 8 - 32, width: 22, height: 22))
@@ -99,8 +126,7 @@ final class BannerView: NSView {
         title.frame = NSRect(x: 46, y: height - 8 - 14 - 18, width: Layout.textWidth, height: 17)
 
         let detail = NSTextField(wrappingLabelWithString: layout.body)
-        detail.font = Layout.bodyFont
-        detail.textColor = .secondaryLabelColor
+        detail.attributedStringValue = Layout.bodyText(layout.body)
         detail.maximumNumberOfLines = 2
         // Word wrap with the last line cut: truncating-tail mode would hold it to one line.
         detail.lineBreakMode = .byWordWrapping
@@ -108,10 +134,10 @@ final class BannerView: NSView {
         detail.frame = NSRect(x: 46, y: height - 8 - 14 - 18 - layout.bodyHeight, width: Layout.textWidth, height: layout.bodyHeight)
 
         let facts = NSTextField(labelWithString: layout.facts)
-        facts.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
-        facts.textColor = .tertiaryLabelColor
+        facts.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        facts.textColor = .secondaryLabelColor
         facts.lineBreakMode = .byTruncatingTail
-        facts.frame = NSRect(x: 46, y: 9, width: Layout.textWidth, height: 13)
+        facts.frame = NSRect(x: 46, y: 9, width: Layout.textWidth, height: 14)
         facts.isHidden = layout.facts.isEmpty
 
         let close = NSButton(frame: NSRect(x: Self.width - 32, y: height - 8 - 26, width: 22, height: 22))
@@ -136,6 +162,21 @@ final class BannerView: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    private let backing = NSView()
+
+    /// Layer colors don't follow light and dark mode by themselves, so resolve it again
+    /// whenever the appearance changes.
+    private func updateBacking() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            backing.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.55).cgColor
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateBacking()
+    }
 
     /// "45 s", "3 min", "1 hr 5 min".
     static func duration(_ seconds: Double) -> String {
