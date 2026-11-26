@@ -48,6 +48,7 @@ struct Config: Equatable {
     var banner = Badge.all    // which sessions pop up an on-screen banner (same three choices as the badge)
     var bannerPosition = BannerPosition.topRight
     var bannerSeconds = 8     // 0 keeps a banner until you dismiss it
+    var bannerPreview = true  // 1.8: the start of Claude's reply in Finished banners
     var finishedMinSeconds = 30   // only chime/banner Finished for turns at least this long (0 = always)
     var reminderMinutes = 5       // remind once about a prompt left unanswered this long (0 = off)
     var compactChime = false      // a soft cue when Claude is about to compact the conversation
@@ -141,6 +142,7 @@ struct Config: Equatable {
             case "showFinished": c.showFinished = on
             case "showWorking": c.showWorking = on
             case "showContext": c.showContext = on
+            case "bannerPreview": c.bannerPreview = on
             case "banner": c.banner = Badge(rawValue: v) ?? c.banner
             case "bannerPosition": c.bannerPosition = BannerPosition(rawValue: v) ?? c.bannerPosition
             case "bannerSeconds": c.bannerSeconds = max(0, min(120, Int(v) ?? c.bannerSeconds))
@@ -162,6 +164,7 @@ struct Config: Equatable {
         showFinished=\(showFinished ? 1 : 0)
         showWorking=\(showWorking ? 1 : 0)
         showContext=\(showContext ? 1 : 0)
+        bannerPreview=\(bannerPreview ? 1 : 0)
         banner=\(banner.rawValue)
         bannerPosition=\(bannerPosition.rawValue)
         bannerSeconds=\(bannerSeconds)
@@ -217,6 +220,8 @@ struct SessionState: Codable, Identifiable {
     // Added in 1.7, only for sessions from another Mac (never written to disk by the hook):
     var remotePeer: String?    // the paired Mac's peer ID
     var remoteHost: String?    // its name, for "on Mac mini"
+    // Added in 1.8 (local only: Other Macs never sends it):
+    var reply: String? = nil   // the start of Claude's last reply, for the Finished banner
 
     var isFailed: Bool { failed == true }
     var isRemote: Bool { remotePeer != nil }
@@ -393,6 +398,47 @@ enum ContextUse {
     }
 }
 
+/**
+ The start of Claude's last reply, as plain text, for a banner: "Fixed the redirect. The
+ login page now…". Markdown marks and code fences are dropped and runs of space folded,
+ so two lines of a banner show words rather than syntax.
+ */
+enum ReplyPreview {
+    static let maxLength = 220
+
+    static func clean(_ text: String) -> String? {
+        var t = text.replacingOccurrences(of: #"```[\s\S]*?```"#, with: " ", options: .regularExpression)
+        t = t.replacingOccurrences(of: #"(?m)^\s{0,3}(#{1,6}|>|[-*+]|\d+\.)\s+"#, with: "", options: .regularExpression)
+        t = t.replacingOccurrences(of: #"[*_`|]+"#, with: "", options: .regularExpression)
+        t = t.replacingOccurrences(of: #"\[([^\]]*)\]\([^)]*\)"#, with: "$1", options: .regularExpression)
+        t = t.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty else { return nil }
+        return t.count > maxLength ? String(t.prefix(maxLength - 1)) + "…" : t
+    }
+
+    /// From the Stop hook's payload when Claude Code sends the reply there, else from the
+    /// last assistant text in the transcript's tail.
+    static func from(payload: [String: Any], transcript: String?) -> String? {
+        if let text = payload["last_assistant_message"] as? String, let c = clean(text) { return c }
+        guard let transcript, let handle = FileHandle(forReadingAtPath: transcript) else { return nil }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        let window: UInt64 = 512 * 1024
+        try? handle.seek(toOffset: size > window ? size - window : 0)
+        guard let data = try? handle.readToEnd(), let text = String(data: data, encoding: .utf8) else { return nil }
+        for line in text.split(separator: "\n").reversed() where line.contains("\"assistant\"") {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  obj["type"] as? String == "assistant",
+                  let blocks = (obj["message"] as? [String: Any])?["content"] as? [[String: Any]] else { continue }
+            let joined = blocks.compactMap { $0["type"] as? String == "text" ? $0["text"] as? String : nil }
+                .joined(separator: " ")
+            if let c = clean(joined) { return c }
+        }
+        return nil
+    }
+}
+
 /// The session's title as shown in the Claude app: the last "custom-title" entry in its transcript.
 func transcriptTitle(_ path: String?) -> String? {
     guard let path, let data = FileManager.default.contents(atPath: path),
@@ -489,7 +535,7 @@ func runHook(_ event: String) -> Never {
 
     @discardableResult
     func record(_ status: SessionState.Status, message: String?, workingSince: Date? = nil,
-                turnSeconds: Double? = nil, failed: Bool = false, note: String = "") -> SessionState? {
+                turnSeconds: Double? = nil, failed: Bool = false, reply: String? = nil, note: String = "") -> SessionState? {
         guard !id.isEmpty else { return nil }
         let previous = Sessions.read(id)
         let folder = URL(fileURLWithPath: cwd).lastPathComponent
@@ -503,7 +549,7 @@ func runHook(_ event: String) -> Never {
                              workingSince: workingSince, turnSeconds: turnSeconds, failed: failed ? true : nil,
                              transcriptPath: transcript ?? previous?.transcriptPath,
                              tty: pid.flatMap(ProcessCheck.tty) ?? previous?.tty,
-                             termProgram: env["TERM_PROGRAM"] ?? previous?.termProgram)
+                             termProgram: env["TERM_PROGRAM"] ?? previous?.termProgram, reply: reply)
         Sessions.write(s)
         EventLog.append("\(event) session=\(short) status=\(status.rawValue) title=\"\(title)\"\(note)")
         return s
@@ -558,7 +604,8 @@ func runHook(_ event: String) -> Never {
         let turn = started.map { Date().timeIntervalSince($0) }
         let long = !config.isShortTurn(turn)
         let note = (turn.map { " turn=\(Int($0))s" } ?? "") + (long ? chime(config.done) : " chime=skipped-short-turn")
-        record(.finished, message: nil, turnSeconds: turn, note: note)
+        record(.finished, message: nil, turnSeconds: turn,
+               reply: ReplyPreview.from(payload: payload, transcript: transcript), note: note)
     case "failure":
         // The turn ended with an error (Claude Code's StopFailure hook).
         let started = Sessions.read(id)?.workingSince
@@ -1032,6 +1079,10 @@ struct SettingsView: View {
                     Text("Until dismissed").tag(0)
                 }
                 .disabled(model.config.banner == .off)
+                Toggle("Preview Claude's reply in banners", isOn: $model.config.bannerPreview)
+                    .disabled(model.config.banner == .off)
+                Text("Turn this off if you share your screen and replies may be private.")
+                    .font(.caption).foregroundStyle(.secondary)
                 HStack {
                     Text("A banner names the session and what it's waiting for. Click it to open the session, or × to dismiss it.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -1730,15 +1781,20 @@ if let i = args.firstIndex(of: "--snapshot-banner"), i + 1 < args.count {
         _ = NSApplication.shared
         let dark = args.contains("--dark"), finished = args.contains("--finished")
         var s = SessionState(id: "demo", status: finished ? .finished : .needsInput,
-                             title: finished ? "Write the release notes" : "Fix the login redirect", cwd: "",
-                             message: finished ? nil : "Claude needs your permission to use Bash", appBundleID: nil, updatedAt: Date())
+                             title: finished ? "Write the release notes" : "Fix the login redirect", cwd: "/Users/someone/api-server",
+                             message: finished ? nil : "Claude wants to run: npm test -- --grep \"login redirect\"", appBundleID: nil, updatedAt: Date())
         if args.contains("--remote") { s.remotePeer = "demo"; s.remoteHost = "Mac mini" }
+        if finished {
+            s.turnSeconds = 252
+            s.reply = ReplyPreview.clean("**Done.** The release notes for 1.8.0 are in `CHANGELOG.md`, with the new permission hook first and the Homebrew cask last. I left the screenshots alone.")
+        }
+        if args.contains("--plain") { s.cwd = ""; s.reply = nil }
         let pad: CGFloat = 20
-        let canvas = NSView(frame: NSRect(x: 0, y: 0, width: BannerView.size.width + 2 * pad, height: BannerView.size.height + 2 * pad))
+        let banner = BannerView(session: s, onOpen: {}, onDismiss: {})
+        let canvas = NSView(frame: NSRect(x: 0, y: 0, width: banner.frame.width + 2 * pad, height: banner.frame.height + 2 * pad))
         canvas.wantsLayer = true
         canvas.layer?.backgroundColor = (dark ? NSColor(calibratedRed: 0.13, green: 0.15, blue: 0.2, alpha: 1)
                                               : NSColor(calibratedRed: 0.78, green: 0.83, blue: 0.9, alpha: 1)).cgColor
-        let banner = BannerView(session: s, onOpen: {}, onDismiss: {})
         banner.frame.origin = NSPoint(x: pad, y: pad)
         // Offscreen rendering can't sample the desktop for the blur, so stand in with the material's tint.
         banner.wantsLayer = true

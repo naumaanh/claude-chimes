@@ -9,16 +9,61 @@ import AppKit
 
 /// The card's contents. Also used by --snapshot-banner.
 final class BannerView: NSView {
-    static let size = NSSize(width: 340, height: 66)
+    static let width: CGFloat = 340
+    /// The height a banner had before 1.8, and still has with nothing extra to say.
+    static let size = NSSize(width: width, height: 66)
 
     private let onOpen: () -> Void
     private let onDismiss: () -> Void
     var onHoverChange: ((Bool) -> Void)?
 
-    init(session s: SessionState, onOpen: @escaping () -> Void, onDismiss: @escaping () -> Void) {
+    /**
+     The banner's lines, top to bottom: what happened, the session, what it is about (up to
+     two lines: the question, the command, the error, or the start of the reply), then small
+     facts (how long, how full the context is, which folder). The card is as tall as that.
+     */
+    init(session s: SessionState, preview: Bool = true, onOpen: @escaping () -> Void, onDismiss: @escaping () -> Void) {
         self.onOpen = onOpen
         self.onDismiss = onDismiss
-        super.init(frame: NSRect(origin: .zero, size: Self.size))
+        let needsInput = s.status == .needsInput, didFail = s.isFailed
+        let body: String = needsInput ? (s.message ?? "Claude is waiting for you")
+            : didFail ? (s.message ?? "Claude hit an error")
+            : (preview ? s.reply : nil) ?? "Claude finished a reply"   // the time is in the facts line
+        var facts: [String] = []
+        if !needsInput, let t = s.turnSeconds { facts.append(BannerView.duration(t)) }
+        if s.remoteHost == nil, let c = ContextUse.label(s.transcriptPath) { facts.append(c) }
+        let folder = s.cwd.isEmpty ? "" : URL(fileURLWithPath: s.cwd).lastPathComponent
+        if !folder.isEmpty, folder != "/", !s.title.localizedCaseInsensitiveContains(folder) { facts.append(folder) }
+        let layout = Layout(body: body, facts: facts.joined(separator: " · "))
+        super.init(frame: NSRect(x: 0, y: 0, width: Self.width, height: layout.height))
+        build(s, layout: layout, needs: needsInput, failed: didFail)
+    }
+
+    /// Where each line goes, measured before the view exists so the card can be sized to fit.
+    struct Layout {
+        let body: String
+        let facts: String
+        let bodyHeight: CGFloat
+        let height: CGFloat
+        static let textWidth: CGFloat = 250
+        static let bodyFont = NSFont.systemFont(ofSize: 12)
+
+        init(body: String, facts: String) {
+            self.body = body
+            self.facts = facts
+            let line = ceil(Self.bodyFont.ascender - Self.bodyFont.descender + Self.bodyFont.leading) + 1
+            let measured = (body as NSString).boundingRect(
+                with: NSSize(width: Self.textWidth, height: 1000),
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                attributes: [.font: Self.bodyFont]).height
+            bodyHeight = measured > line * 1.5 ? line * 2 : line
+            // 8 top, caption 14, title 17, body, facts 13 with a 6 pt gap, 9 bottom.
+            height = 8 + 14 + 18 + bodyHeight + (facts.isEmpty ? 0 : 19) + 9
+        }
+    }
+
+    private func build(_ s: SessionState, layout: Layout, needs: Bool, failed: Bool) {
+        let height = layout.height
 
         let blur = NSVisualEffectView(frame: bounds)
         blur.material = .popover
@@ -32,8 +77,8 @@ final class BannerView: NSView {
         blur.autoresizingMask = [.width, .height]
         addSubview(blur)
 
-        let needs = s.status == .needsInput, failed = s.isFailed
-        let icon = NSImageView(frame: NSRect(x: 14, y: (Self.size.height - 22) / 2, width: 22, height: 22))
+        // The icon sits beside the caption and title, where the eye starts, not mid-card.
+        let icon = NSImageView(frame: NSRect(x: 14, y: height - 8 - 32, width: 22, height: 22))
         icon.image = NSImage(systemSymbolName: needs ? "exclamationmark.bubble.fill"
                                 : failed ? "exclamationmark.triangle.fill" : "checkmark.bubble.fill",
                              accessibilityDescription: nil)
@@ -46,22 +91,30 @@ final class BannerView: NSView {
         caption.lineBreakMode = .byTruncatingTail
         caption.font = .systemFont(ofSize: 11, weight: .medium)
         caption.textColor = tint
-        caption.frame = NSRect(x: 46, y: 42, width: 250, height: 14)
+        caption.frame = NSRect(x: 46, y: height - 8 - 14, width: Layout.textWidth, height: 14)
 
         let title = NSTextField(labelWithString: s.title)
         title.font = .systemFont(ofSize: 13, weight: .semibold)
         title.lineBreakMode = .byTruncatingTail
-        title.frame = NSRect(x: 46, y: 24, width: 250, height: 17)
+        title.frame = NSRect(x: 46, y: height - 8 - 14 - 18, width: Layout.textWidth, height: 17)
 
-        let finishedText = s.turnSeconds.map { "Claude finished a reply after \(BannerView.duration($0))" } ?? "Claude finished a reply"
-        let detail = NSTextField(labelWithString: needs ? (s.message ?? "Claude is waiting for you")
-                                 : failed ? (s.message ?? "Claude hit an error") : finishedText)
-        detail.font = .systemFont(ofSize: 12)
+        let detail = NSTextField(wrappingLabelWithString: layout.body)
+        detail.font = Layout.bodyFont
         detail.textColor = .secondaryLabelColor
-        detail.lineBreakMode = .byTruncatingTail
-        detail.frame = NSRect(x: 46, y: 8, width: 250, height: 15)
+        detail.maximumNumberOfLines = 2
+        // Word wrap with the last line cut: truncating-tail mode would hold it to one line.
+        detail.lineBreakMode = .byWordWrapping
+        detail.cell?.truncatesLastVisibleLine = true
+        detail.frame = NSRect(x: 46, y: height - 8 - 14 - 18 - layout.bodyHeight, width: Layout.textWidth, height: layout.bodyHeight)
 
-        let close = NSButton(frame: NSRect(x: Self.size.width - 32, y: (Self.size.height - 22) / 2, width: 22, height: 22))
+        let facts = NSTextField(labelWithString: layout.facts)
+        facts.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
+        facts.textColor = .tertiaryLabelColor
+        facts.lineBreakMode = .byTruncatingTail
+        facts.frame = NSRect(x: 46, y: 9, width: Layout.textWidth, height: 13)
+        facts.isHidden = layout.facts.isEmpty
+
+        let close = NSButton(frame: NSRect(x: Self.width - 32, y: height - 8 - 26, width: 22, height: 22))
         close.isBordered = false
         close.bezelStyle = .regularSquare
         close.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "Dismiss")
@@ -72,11 +125,11 @@ final class BannerView: NSView {
         close.action = #selector(closeTapped)
         close.toolTip = "Dismiss (done with this session)"
 
-        [icon, caption, title, detail, close].forEach(addSubview)
+        [icon, caption, title, detail, facts, close].forEach(addSubview)
 
         setAccessibilityElement(true)
         setAccessibilityRole(.button)
-        setAccessibilityLabel("\(caption.stringValue): \(s.title). \(detail.stringValue)")
+        setAccessibilityLabel("\(caption.stringValue): \(s.title). \(layout.body)" + (layout.facts.isEmpty ? "" : ". \(layout.facts)"))
         setAccessibilityCustomActions([NSAccessibilityCustomAction(name: "Dismiss") { [weak self] in
             self?.onDismiss(); return true
         }])
@@ -134,7 +187,10 @@ final class BannerCenter {
         remove(id: s.id, animated: false)
         let c = config()
 
-        let panel = NSPanel(contentRect: NSRect(origin: .zero, size: BannerView.size),
+        let view = BannerView(session: s, preview: c.bannerPreview,
+                              onOpen: { [weak self] in self?.remove(id: s.id, animated: true); self?.onOpen(s) },
+                              onDismiss: { [weak self] in self?.remove(id: s.id, animated: true); self?.onDismiss(s) })
+        let panel = NSPanel(contentRect: NSRect(origin: .zero, size: view.frame.size),
                             styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = .statusBar
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
@@ -146,9 +202,6 @@ final class BannerCenter {
         panel.becomesKeyOnlyIfNeeded = true
 
         let entry = Entry(id: s.id, panel: panel)
-        let view = BannerView(session: s,
-                              onOpen: { [weak self] in self?.remove(id: s.id, animated: true); self?.onOpen(s) },
-                              onDismiss: { [weak self] in self?.remove(id: s.id, animated: true); self?.onDismiss(s) })
         view.onHoverChange = { [weak self, weak entry] on in
             guard let self, let entry else { return }
             entry.hovering = on
@@ -220,10 +273,11 @@ final class BannerCenter {
     }
 
     /// Where the banner at stack position `index` goes, on the screen with the menu bar.
+    /// Banners differ in height since 1.8, so each one moves past the ones before it.
     private func frame(at index: Int, position: Config.BannerPosition) -> NSRect {
         let screen = (NSScreen.screens.first ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let size = BannerView.size
-        let step = CGFloat(index) * (size.height + gap)
+        let size = index < entries.count ? entries[index].panel.frame.size : BannerView.size
+        let step = entries.prefix(index).reduce(CGFloat(0)) { $0 + $1.panel.frame.height + gap }
         switch position {
         case .topRight:
             return NSRect(x: screen.maxX - size.width - margin, y: screen.maxY - size.height - margin - step, width: size.width, height: size.height)

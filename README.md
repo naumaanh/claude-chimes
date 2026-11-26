@@ -26,7 +26,7 @@ By default the Finished chime only plays when Claude worked for more than 30 sec
 
 The menu bar lists the sessions waiting on you. Some need your input, with the question they're asking; others have finished and are ready for your reply. A badge next to the icon counts them, red when something needs you and gray when sessions are only waiting for a reply. Each row also shows how full that session's context is. Clicking a desktop-app chat opens it, and clicking a CLI session brings your terminal to the front.
 
-The menu also has volume and mute. It can also show a small on-screen banner when a session needs you or finishes, naming the session and what it's waiting for. Everything else lives in a Settings window, where you can pick each sound from the bundled chimes, your own files or the macOS sounds, preview it, and check that the setup is healthy. To add your own sound, choose Add Sound… in any sound menu, or drop a `.wav`, `.aiff`, `.mp3`, `.m4a` or `.caf` file into `~/.claude/chimes/sounds`.
+The menu also has volume and mute. It can also show a small on-screen banner when a session needs you or finishes, naming the session and what it's waiting for: the question or command Claude is asking about, or the start of its reply, with how long the turn took and how full the context is. Everything else lives in a Settings window, where you can pick each sound from the bundled chimes, your own files or the macOS sounds, preview it, and check that the setup is healthy. To add your own sound, choose Add Sound… in any sound menu, or drop a `.wav`, `.aiff`, `.mp3`, `.m4a` or `.caf` file into `~/.claude/chimes/sounds`.
 
 The chimes play straight from the hooks, so they work even when the menu bar app isn't running.
 

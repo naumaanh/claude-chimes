@@ -184,6 +184,18 @@ printf '%s\n' '{"type":"user","message":{"role":"user","content":"hi"}}' \
 check "context comes from the last reply, cache included" '[ "$(lim "$BIN" --context "$T" </dev/null)" = "182k context" ]'
 check "a transcript with no replies says unknown" '[ "$(lim "$BIN" --context "$SETTINGS" </dev/null)" = unknown ]'
 
+section "Reply previews for banners"
+R="$WORK/r.jsonl"
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"go"}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]}}' \
+  '{"type":"assistant","message":{"content":[{"type":"text","text":"## Done\n\n**Fixed** the `login` redirect. See [the PR](https://x.test/1).\n```\ncode here\n```"}]}}' > "$R"
+echo "{\"session_id\":\"r1\",\"cwd\":\"/tmp/r1\",\"transcript_path\":\"$R\"}" | lim "$HOOK" stop
+check "a finished turn keeps the start of the reply, as plain text" 'python3 -c "import json,sys; r=json.load(open(sys.argv[1]))[\"reply\"]; assert r==\"Done Fixed the login redirect. See the PR.\", r" "$SESSIONS/r1.json"'
+echo '{"session_id":"r2","cwd":"/tmp/r2","last_assistant_message":"All 40 tests pass."}' | lim "$HOOK" stop
+check "the reply in the Stop payload is used when there is one" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"reply\"]==\"All 40 tests pass.\"" "$SESSIONS/r2.json"'
+check "the reply is never sent to other Macs" '! grep -q "\"reply\"" "$ROOT/app/Sources/Peers.swift"'
+rm -f "$SESSIONS"/r1.json "$SESSIONS"/r2.json
+
 section "Adding your own sounds"
 mkdir -p "$WORK/mine" "$WORK/other"
 cp "$HOME/.claude/chimes/sounds/input-nudge.wav" "$WORK/mine/Ding.wav"
