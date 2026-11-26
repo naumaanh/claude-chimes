@@ -44,6 +44,7 @@ struct Config: Equatable {
     var badge = Badge.all     // what the number badge on the menu bar icon counts
     var showFinished = true   // list sessions that finished and are waiting for your reply
     var showWorking = true    // list sessions Claude is working on right now
+    var showContext = true    // 1.8: "421k context" on each session row
     var banner = Badge.all    // which sessions pop up an on-screen banner (same three choices as the badge)
     var bannerPosition = BannerPosition.topRight
     var bannerSeconds = 8     // 0 keeps a banner until you dismiss it
@@ -139,6 +140,7 @@ struct Config: Equatable {
             case "showCount": if !on { c.badge = .off }   // 1.1 setting; replaced by badge
             case "showFinished": c.showFinished = on
             case "showWorking": c.showWorking = on
+            case "showContext": c.showContext = on
             case "banner": c.banner = Badge(rawValue: v) ?? c.banner
             case "bannerPosition": c.bannerPosition = BannerPosition(rawValue: v) ?? c.bannerPosition
             case "bannerSeconds": c.bannerSeconds = max(0, min(120, Int(v) ?? c.bannerSeconds))
@@ -159,6 +161,7 @@ struct Config: Equatable {
         badge=\(badge.rawValue)
         showFinished=\(showFinished ? 1 : 0)
         showWorking=\(showWorking ? 1 : 0)
+        showContext=\(showContext ? 1 : 0)
         banner=\(banner.rawValue)
         bannerPosition=\(bannerPosition.rawValue)
         bannerSeconds=\(bannerSeconds)
@@ -357,6 +360,37 @@ enum Sessions {
 
     static let encoder: JSONEncoder = { let e = JSONEncoder(); e.dateEncodingStrategy = .secondsSince1970; return e }()
     static let decoder: JSONDecoder = { let d = JSONDecoder(); d.dateDecodingStrategy = .secondsSince1970; return d }()
+}
+
+/**
+ How full a session's context is, from its transcript: the input of the last reply,
+ counting what came from the cache. Shown as "421k context", not a percentage, because
+ the window differs by model and plan, and a guessed denominator would mislead.
+ Reads only the end of the file, so a long transcript costs no more than a short one.
+ */
+enum ContextUse {
+    static func tokens(_ path: String?) -> Int? {
+        guard let path, let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        let window: UInt64 = 512 * 1024
+        try? handle.seek(toOffset: size > window ? size - window : 0)
+        guard let data = try? handle.readToEnd(), let text = String(data: data, encoding: .utf8) else { return nil }
+        for line in text.split(separator: "\n").reversed() where line.contains("\"usage\"") && line.contains("\"assistant\"") {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let message = obj["message"] as? [String: Any],
+                  let usage = message["usage"] as? [String: Any] else { continue }
+            let parts = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+            let total = parts.compactMap { (usage[$0] as? NSNumber)?.intValue }.reduce(0, +)
+            if total > 0 { return total }
+        }
+        return nil
+    }
+
+    static func label(_ path: String?) -> String? {
+        guard let n = tokens(path) else { return nil }
+        return n >= 1000 ? "\(Int((Double(n) / 1000).rounded()))k context" : "\(n) context"
+    }
 }
 
 /// The session's title as shown in the Claude app: the last "custom-title" entry in its transcript.
@@ -981,6 +1015,7 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("List sessions ready for your reply", isOn: $model.config.showFinished)
                 Toggle("List sessions Claude is working on", isOn: $model.config.showWorking)
+                Toggle("Show how full each session's context is", isOn: $model.config.showContext)
             }
 
             Section("Banners") {
@@ -1299,7 +1334,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let i = NSMenuItem(title: s.title, action: nil, keyEquivalent: "")
         i.representedObject = s
         i.toolTip = s.remoteHost.map { "Running on \($0). Open it on that Mac. Clicking clears it here." } ?? s.cwd
-        let detail = s.remoteHost.map { "\(detail) · on \($0)" } ?? detail
+        var detail = s.remoteHost.map { "\(detail) · on \($0)" } ?? detail
+        if s.remoteHost == nil, model.config.showContext, let context = ContextUse.label(s.transcriptPath) {
+            detail += " · \(context)"
+        }
         i.view = SessionRowView(title: s.title, subtitle: detail, symbol: symbol, iconTint: tint,
                                 onOpen: { [weak self] in self?.open(s) },
                                 onDismiss: { [weak self, weak i] in self?.dismiss(s, in: i?.menu) })
@@ -1541,6 +1579,11 @@ if args.contains("--setup") || args.contains("--repair") {
 if args.contains("--uninstall") {
     do { try Installer.uninstall(deleteData: args.contains("--delete-data")); print("Claude Chimes hooks removed.") }
     catch { FileHandle.standardError.write(Data("Uninstall failed: \(error.localizedDescription)\n".utf8)); exit(1) }
+    exit(0)
+}
+// `--context <transcript.jsonl>` prints what a session row would say about its context.
+if let i = args.firstIndex(of: "--context") {
+    print(i + 1 < args.count ? (ContextUse.label(args[i + 1]) ?? "unknown") : "unknown")
     exit(0)
 }
 // `--add-sound <file>` copies a sound in, as Add Sound… does, and prints where it landed.

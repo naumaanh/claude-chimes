@@ -175,6 +175,15 @@ check "a session started after it is not" '! lim "$HOOK" --doctor </dev/null | g
 kill $NEW 2>/dev/null; wait $NEW 2>/dev/null
 unset CLAUDE_CHIMES_PROCESS_NAME
 
+section "Context use"
+T="$WORK/t.jsonl"
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"hi"}}' \
+  '{"type":"assistant","message":{"usage":{"input_tokens":5,"cache_read_input_tokens":120000,"cache_creation_input_tokens":3400}}}' \
+  '{"type":"assistant","message":{"usage":{"input_tokens":2,"cache_read_input_tokens":181000,"cache_creation_input_tokens":500}}}' \
+  '{"type":"user","message":{"role":"user","content":"thanks"}}' > "$T"
+check "context comes from the last reply, cache included" '[ "$(lim "$BIN" --context "$T" </dev/null)" = "182k context" ]'
+check "a transcript with no replies says unknown" '[ "$(lim "$BIN" --context "$SETTINGS" </dev/null)" = unknown ]'
+
 section "Adding your own sounds"
 mkdir -p "$WORK/mine" "$WORK/other"
 cp "$HOME/.claude/chimes/sounds/input-nudge.wav" "$WORK/mine/Ding.wav"
