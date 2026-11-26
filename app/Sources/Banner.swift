@@ -334,13 +334,43 @@ final class BannerCenter {
 
     var visibleIDs: [String] { entries.map(\.id) }
 
+    /**
+     Closes the banner after `seconds` of you being at the Mac. A banner that times out
+     while you're away was never seen, so the countdown only runs while you're using the
+     Mac: when it ends with no keyboard or mouse input for a while, it waits and checks again.
+     */
     private func schedule(_ entry: Entry, seconds: Int) {
         entry.timer?.invalidate()
         guard seconds > 0, !entry.hovering else { return }
         entry.timer = Timer.scheduledTimer(withTimeInterval: TimeInterval(seconds), repeats: false) { [weak self, weak entry] _ in
             MainActor.assumeIsolated {
                 guard let self, let entry else { return }
-                self.remove(id: entry.id, animated: true)
+                if BannerCenter.idleSeconds() > BannerCenter.awayAfter {
+                    // Away: look again soon, and give the full time once input resumes.
+                    self.waitForReturn(entry, seconds: seconds)
+                } else {
+                    self.remove(id: entry.id, animated: true)
+                }
+            }
+        }
+    }
+
+    /// No keyboard or mouse input for this long means you're not looking at the screen.
+    static let awayAfter: TimeInterval = 10
+
+    /// Seconds since the last keyboard or mouse input anywhere on the Mac.
+    static func idleSeconds() -> TimeInterval {
+        CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
+    }
+
+    private func waitForReturn(_ entry: Entry, seconds: Int) {
+        entry.timer?.invalidate()
+        entry.timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self, weak entry] timer in
+            MainActor.assumeIsolated {
+                guard let self, let entry else { timer.invalidate(); return }
+                guard BannerCenter.idleSeconds() < 2 else { return }
+                timer.invalidate()
+                self.schedule(entry, seconds: seconds)   // back: the full time to read it
             }
         }
     }
