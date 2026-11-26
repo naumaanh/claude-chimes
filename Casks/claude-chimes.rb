@@ -25,11 +25,14 @@ cask "claude-chimes" do
     system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{appdir}/Claude Chimes.app"]
   end
 
-  # Removing the app leaves its hooks in ~/.claude/settings.json pointing at nothing, so
-  # take them out first, the same way Settings → Uninstall does.
-  uninstall_preflight do
-    system_command "#{appdir}/Claude Chimes.app/Contents/MacOS/ClaudeChimes", args: ["--uninstall"]
-  end
+  # No uninstall step that removes the hooks: Homebrew runs uninstall steps on every
+  # `brew upgrade` too, and the new version only restores hooks when some are still there,
+  # so upgrading would silence it for good. The hooks point at the app's own path, which
+  # an upgrade keeps.
+  caveats <<~EOS
+    To remove Claude Chimes completely, first use Settings → Uninstall in the app (it takes
+    its hooks out of ~/.claude/settings.json), then run `brew uninstall --cask claude-chimes`.
+  EOS
 
   zap trash: "~/.claude/chimes"
 end

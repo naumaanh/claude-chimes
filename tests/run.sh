@@ -69,6 +69,9 @@ check "PermissionRequest prints nothing, so it decides nothing" '[ ! -s "$WORK/p
 check "PermissionRequest chimes" 'lastlog | grep -q "permission session=p1.*chime=played"'
 hook p1 notification
 check "a Notification for the same prompt doesn't chime again" 'lastlog | grep -q "notification session=p1.*chime=already-asked"'
+check "it keeps the more specific permission message" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"message\"]==\"Claude wants to run: npm test\"" "$SESSIONS/p1.json"'
+echo '{"session_id":"p1","cwd":"/tmp/p1","tool_name":"Bash","tool_input":{"command":"git clean -fd"}}' | lim "$HOOK" permission
+check "a new prompt right after a denied one still chimes" 'lastlog | grep -q "permission session=p1.*chime=played"'
 hook s1 tool
 check "a tool run returns it to working" '[ "$(status_of s1)" = working ]'
 hook s1 stop CLAUDE_CODE_ENTRYPOINT=cli
@@ -165,11 +168,12 @@ export CLAUDE_CHIMES_PROCESS_NAME=chimes-stand-in
 # and a symlink reports the name of what it points at.
 printf '#include <unistd.h>\nint main(void) { sleep(60); return 0; }\n' | cc -x c - -o "$WORK/chimes-stand-in"
 "$WORK/chimes-stand-in" & OLD=$!
+"$WORK/chimes-stand-in" -p "summarize this" & ONESHOT=$!   # a one-shot run, not a conversation
 sleep 1.5
 lim "$BIN" --uninstall </dev/null >/dev/null; lim "$BIN" --setup </dev/null >/dev/null
 check "setup records when it wrote the hooks" '[ -s "$HOME/.claude/chimes/hooks-written" ]'
-check "a session started before that is flagged" 'lim "$HOOK" --doctor </dev/null | grep -q "1 Claude session started before"'
-kill $OLD 2>/dev/null; wait $OLD 2>/dev/null
+check "a session started before that is flagged, a one-shot -p run is not" 'lim "$HOOK" --doctor </dev/null | grep -q "1 Claude session started before"'
+kill $OLD $ONESHOT 2>/dev/null; wait $OLD $ONESHOT 2>/dev/null
 "$WORK/chimes-stand-in" & NEW=$!
 check "a session started after it is not" '! lim "$HOOK" --doctor </dev/null | grep -q "started before Claude Chimes"'
 kill $NEW 2>/dev/null; wait $NEW 2>/dev/null
@@ -210,8 +214,17 @@ head -2 "$W" > "$WORK/w2.jsonl"; printf '%s\n' '{"type":"user","message":{"role"
   '{"type":"assistant","message":{"content":[{"type":"text","text":"Renamed the file.\n\nShould I commit it?"}]}}' >> "$WORK/w2.jsonl"
 echo "{\"session_id\":\"w2\",\"cwd\":\"/tmp/w2\",\"transcript_path\":\"$WORK/w2.jsonl\"}" | lim "$HOOK" stop
 check "an earlier turn's recap is never used" 'python3 -c "import json,sys; s=json.load(open(sys.argv[1])); assert s[\"reply\"]==\"Renamed the file.\" and not s.get(\"replyIsRecap\"), s" "$SESSIONS/w2.json"'
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"go"}}' '{"type":"assistant","message":{"content":[{"type":"text","text":"Built it.\n\nShould I **push** `main`?"}]}}' > "$WORK/w3.jsonl"
+echo "{\"session_id\":\"w3\",\"cwd\":\"/tmp/w3\",\"transcript_path\":\"$WORK/w3.jsonl\"}" | lim "$HOOK" stop
+check "a question with markdown in it shows once, not twice" 'python3 -c "import json,sys; s=json.load(open(sys.argv[1])); assert s[\"reply\"]==\"Built it.\" and s[\"ask\"]==\"Should I push main?\", s" "$SESSIONS/w3.json"'
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"go"}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__ccd_turn__wrap_up","input":{"recap":"Recap before a notice."}}]}}' \
+  '{"type":"user","message":{"role":"user","content":"<task-notification>\nThe build finished.\n</task-notification>"}}' \
+  '{"type":"assistant","message":{"content":[{"type":"text","text":"Noted."}]}}' > "$WORK/w4.jsonl"
+echo "{\"session_id\":\"w4\",\"cwd\":\"/tmp/w4\",\"transcript_path\":\"$WORK/w4.jsonl\"}" | lim "$HOOK" stop
+check "a notice the app injects doesn't hide the turn's recap" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"reply\"]==\"Recap before a notice.\"" "$SESSIONS/w4.json"'
 check "without a recap, a closing question is pulled out" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"ask\"]==\"Should I commit it?\"" "$SESSIONS/w2.json"'
-rm -f "$SESSIONS"/w1.json "$SESSIONS"/w2.json
+rm -f "$SESSIONS"/w1.json "$SESSIONS"/w2.json "$SESSIONS"/w3.json "$SESSIONS"/w4.json
 
 section "Adding your own sounds"
 mkdir -p "$WORK/mine" "$WORK/other"

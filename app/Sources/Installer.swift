@@ -141,7 +141,8 @@ enum Installer {
     /// Running Claude Code sessions that started before the hooks were last written.
     static func sessionsOnOldHooks() -> [Int32] {
         guard let written = hooksWrittenAt else { return [] }
-        return ProcessCheck.claudeProcesses().filter { $0.value < written - 1 }.map(\.key).sorted()
+        return ProcessCheck.claudeProcesses().filter { $0.value < written - 1 && ProcessCheck.isSession($0.key) }
+            .map(\.key).sorted()
     }
 
     // MARK: Files

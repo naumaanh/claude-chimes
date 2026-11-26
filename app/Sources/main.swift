@@ -224,6 +224,7 @@ struct SessionState: Codable, Identifiable {
     var reply: String? = nil   // the turn's recap, or the start of Claude's last reply, for the banner
     var ask: String? = nil     // a question Claude left you at the end of the turn
     var replyIsRecap: Bool? = nil
+    var askedVia: [String]? = nil  // which of Notification and PermissionRequest reported this prompt
 
     var isFailed: Bool { failed == true }
     var isRemote: Bool { remotePeer != nil }
@@ -306,6 +307,36 @@ enum ProcessCheck {
             out[p.kp_proc.p_pid] = Double(tv.tv_sec) + Double(tv.tv_usec) / 1_000_000
         }
         return out
+    }
+
+    /// A process's arguments (argv), or [] when they can't be read.
+    static func arguments(_ pid: Int32) -> [String] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return [] }
+        var buffer = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0 else { return [] }
+        let argc = buffer.withUnsafeBytes { $0.load(as: Int32.self) }
+        // After argc: the executable path, padding NULs, then argc NUL-terminated strings.
+        var i = MemoryLayout<Int32>.size
+        while i < size, buffer[i] != 0 { i += 1 }
+        while i < size, buffer[i] == 0 { i += 1 }
+        var args: [String] = []
+        while args.count < Int(argc), i < size {
+            let start = i
+            while i < size, buffer[i] != 0 { i += 1 }
+            args.append(String(decoding: buffer[start..<i], as: UTF8.self))
+            i += 1
+        }
+        return args
+    }
+
+    /// A `claude` process that is a conversation, not a one-shot `claude -p` run or a
+    /// `claude mcp …` server: only conversations wait on you, so only they matter here.
+    static func isSession(_ pid: Int32) -> Bool {
+        let args = arguments(pid).dropFirst()
+        if args.first == "mcp" { return false }
+        return !args.contains("-p") && !args.contains("--print")
     }
 
     static func isAlive(pid: Int32, startedAt: Double?) -> Bool {
@@ -394,6 +425,19 @@ enum ContextUse {
         return nil
     }
 
+    /// Labels already worked out, keyed by path, and checked against the file's size and
+    /// modification time, so opening the menu reads a transcript only when it has changed.
+    @MainActor private static var cache: [String: (stamp: String, label: String?)] = [:]
+
+    @MainActor static func cachedLabel(_ path: String?) -> String? {
+        guard let path, let a = try? FileManager.default.attributesOfItem(atPath: path) else { return nil }
+        let stamp = "\((a[.size] as? NSNumber)?.intValue ?? 0)@\((a[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)"
+        if let hit = cache[path], hit.stamp == stamp { return hit.label }
+        let value = label(path)
+        cache[path] = (stamp, value)
+        return value
+    }
+
     static func label(_ path: String?) -> String? {
         guard let n = tokens(path) else { return nil }
         return n >= 1000 ? "\(Int((Double(n) / 1000).rounded()))k context" : "\(n) context"
@@ -445,8 +489,9 @@ enum ReplyPreview {
         let reply = (payload["last_assistant_message"] as? String) ?? tail.flatMap(lastReply)
         guard let reply else { return Summary() }
         let ask = closingQuestion(reply)
-        var body = reply
-        // Don't spend the preview's lines on the question it shows on its own line.
+        // Don't spend the preview's lines on the question it shows on its own line. Both are
+        // cleaned first, so markdown in the question can't stop the match.
+        var body = clean(reply, max: .max) ?? ""
         if let ask, let range = body.range(of: ask, options: .backwards) { body.removeSubrange(range) }
         return Summary(text: clean(body), ask: ask)
     }
@@ -472,9 +517,20 @@ enum ReplyPreview {
     private static func isPrompt(_ obj: [String: Any]) -> Bool {
         guard obj["type"] as? String == "user", obj["isMeta"] as? Bool != true,
               let content = (obj["message"] as? [String: Any])?["content"] else { return false }
-        if content is String { return true }
-        guard let blocks = content as? [[String: Any]] else { return false }
-        return blocks.contains { $0["type"] as? String == "text" } && !blocks.contains { $0["type"] as? String == "tool_result" }
+        let text: String
+        if let string = content as? String {
+            text = string
+        } else if let blocks = content as? [[String: Any]], !blocks.contains(where: { $0["type"] as? String == "tool_result" }),
+                  let first = blocks.first(where: { $0["type"] as? String == "text" })?["text"] as? String {
+            text = first
+        } else {
+            return false
+        }
+        // Notices the app adds during a turn (a background task finishing, a reminder) arrive
+        // as user rows too. They are part of the turn, so a recap before them still counts.
+        let injected = ["<task-notification>", "<system-reminder>", "<local-command", "<command-name>", "<bash-"]
+        let start = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !injected.contains { start.hasPrefix($0) }
     }
 
     /// The latest end-of-turn recap in this turn (after your last message), if any.
@@ -601,7 +657,8 @@ func runHook(_ event: String) -> Never {
 
     @discardableResult
     func record(_ status: SessionState.Status, message: String?, workingSince: Date? = nil,
-                turnSeconds: Double? = nil, failed: Bool = false, summary: ReplyPreview.Summary? = nil, note: String = "") -> SessionState? {
+                turnSeconds: Double? = nil, failed: Bool = false, summary: ReplyPreview.Summary? = nil,
+                askedVia: [String]? = nil, note: String = "") -> SessionState? {
         guard !id.isEmpty else { return nil }
         let previous = Sessions.read(id)
         let folder = URL(fileURLWithPath: cwd).lastPathComponent
@@ -616,7 +673,8 @@ func runHook(_ event: String) -> Never {
                              transcriptPath: transcript ?? previous?.transcriptPath,
                              tty: pid.flatMap(ProcessCheck.tty) ?? previous?.tty,
                              termProgram: env["TERM_PROGRAM"] ?? previous?.termProgram,
-                             reply: summary?.text, ask: summary?.ask, replyIsRecap: summary?.isRecap == true ? true : nil)
+                             reply: summary?.text, ask: summary?.ask, replyIsRecap: summary?.isRecap == true ? true : nil,
+                             askedVia: askedVia)
         Sessions.write(s)
         EventLog.append("\(event) session=\(short) status=\(status.rawValue) title=\"\(title)\"\(note)")
         return s
@@ -630,11 +688,17 @@ func runHook(_ event: String) -> Never {
         return " chime=played"
     }
 
-    /// True when this session started waiting on you in the last few seconds, which means
-    /// the other of Notification and PermissionRequest already chimed for the same prompt.
-    func justAsked(_ prev: SessionState?) -> Bool {
-        guard let prev, prev.status == .needsInput else { return false }
-        return Date().timeIntervalSince(prev.updatedAt) < 8
+    /**
+     Notification and PermissionRequest can both report one permission dialog. The prompt is
+     the same one when the session started waiting in the last few seconds and this kind of
+     event hasn't reported it yet; then it records without a second chime. The same kind of
+     event again means a new prompt (say you denied one and Claude asked for something else).
+     Returns whether it's the same prompt, and the events that have now reported it.
+     */
+    func samePrompt(_ prev: SessionState?) -> (Bool, [String]) {
+        guard let prev, prev.status == .needsInput, Date().timeIntervalSince(prev.updatedAt) < 8,
+              let seen = prev.askedVia, !seen.isEmpty, !seen.contains(event) else { return (false, [event]) }
+        return (true, seen + [event])
     }
 
     switch event {
@@ -648,18 +712,21 @@ func runHook(_ event: String) -> Never {
             EventLog.append("notification session=\(short) type=\(type) skipped")
             exit(0)
         }
-        // PermissionRequest may have chimed for this same prompt a moment ago: take the
-        // message, which reads better, but don't chime twice.
+        // PermissionRequest may have chimed for this same prompt a moment ago. Then keep its
+        // message ("Claude wants to run: npm test"), which says more than this one's.
         let prev = Sessions.read(id)
-        record(.needsInput, message: payload["message"] as? String, workingSince: prev?.workingSince,
-               note: justAsked(prev) ? " chime=already-asked" : chime(config.input))
+        let (same, via) = samePrompt(prev)
+        let message = same && via.contains("permission") ? prev?.message : payload["message"] as? String
+        record(.needsInput, message: message, workingSince: prev?.workingSince, askedVia: via,
+               note: same ? " chime=already-asked" : chime(config.input))
     case "permission":
         // Claude Code's PermissionRequest: a permission dialog is open. Fires reliably in the
         // desktop app, where Notification's permission_prompt sometimes doesn't. This hook
         // prints nothing, so it makes no decision and the dialog shows as usual.
         let prev = Sessions.read(id)
-        record(.needsInput, message: permissionMessage(payload), workingSince: prev?.workingSince,
-               note: justAsked(prev) ? " chime=already-asked" : chime(config.input))
+        let (same, via) = samePrompt(prev)
+        record(.needsInput, message: permissionMessage(payload), workingSince: prev?.workingSince, askedVia: via,
+               note: same ? " chime=already-asked" : chime(config.input))
     case "tool":
         // A tool ran, so a pending permission prompt was answered and Claude is working again.
         // (Runs after every tool call, so it only writes when something changes.)
@@ -1026,7 +1093,11 @@ struct SoundRow: View {
             Picker(title, selection: Binding(get: { path }, set: { choice in
                 if choice == SoundImport.tag {
                     // The menu item, not a sound: pick a file, copy it in, and use it here.
-                    if let added = SoundImport.choose() { path = added.path; model.preview(added.path) }
+                    // On the next turn of the run loop, not inside SwiftUI's update.
+                    let binding = $path
+                    DispatchQueue.main.async {
+                        if let added = SoundImport.choose() { binding.wrappedValue = added.path; model.preview(added.path) }
+                    }
                 } else {
                     path = choice
                     model.preview(choice)
@@ -1453,7 +1524,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         i.representedObject = s
         i.toolTip = s.remoteHost.map { "Running on \($0). Open it on that Mac. Clicking clears it here." } ?? s.cwd
         var detail = s.remoteHost.map { "\(detail) · on \($0)" } ?? detail
-        if s.remoteHost == nil, model.config.showContext, let context = ContextUse.label(s.transcriptPath) {
+        if s.remoteHost == nil, model.config.showContext, let context = ContextUse.cachedLabel(s.transcriptPath) {
             detail += " · \(context)"
         }
         i.view = SessionRowView(title: s.title, subtitle: detail, symbol: symbol, iconTint: tint,
